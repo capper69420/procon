@@ -224,6 +224,17 @@ KALMAN_MEASURE_NOISE = 1e-3
 # SpO₂ display smoothing
 SPO2_SMOOTH_ALPHA    = 0.15   # EMA weight for new estimate
 
+# ── Multi-face tracking ───────────────────────────────────────────────────────
+# Maximum faces MediaPipe FaceMesh will detect in one frame.
+MAX_NUM_FACES       = 4
+# Minimum bounding-box IoU required to re-use an existing FaceTrack across
+# frames.  Below this threshold a new track (and a new Kalman filter) is
+# created instead.
+FACE_MATCH_IOU_MIN  = 0.25
+# Seconds without a matching detection before a FaceTrack is retired and its
+# Kalman filter / RppgProcessor are freed.
+FACE_TRACK_TIMEOUT  = 2.0
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  COLOUR PALETTE  (BGR)
@@ -336,7 +347,12 @@ class KalmanStabiliser:
 
 
 class LandmarkKalman:
-    """Manages per-landmark (x, y) Kalman pairs for a set of face landmarks."""
+    """
+    Manages per-landmark (x, y) Kalman pairs for ONE face's 468 landmarks.
+
+    One instance must be created per tracked face; sharing an instance across
+    multiple faces corrupts the filter state and causes landmark jumps.
+    """
     def __init__(self, num_landmarks: int) -> None:
         self.kx = [KalmanStabiliser() for _ in range(num_landmarks)]
         self.ky = [KalmanStabiliser() for _ in range(num_landmarks)]
@@ -344,15 +360,14 @@ class LandmarkKalman:
     def update(self, lm_list: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
         """
         Accepts raw (x, y) landmark list, returns Kalman-smoothed positions.
-        Dynamically scales if the landmark list size exceeds the initial filter allocation.
+        Dynamically expands if the list has more landmarks than initially
+        allocated (e.g. refined iris landmarks add a few extra points).
         """
         smoothed = []
         for i, (x, y) in enumerate(lm_list):
-            # Dynamic expansion to prevent IndexError if more landmarks (like irises) appear
-            while len(self.kx) <= i:
+            while len(self.kx) <= i:          # safe dynamic expansion
                 self.kx.append(KalmanStabiliser())
                 self.ky.append(KalmanStabiliser())
-
             sx = self.kx[i].update(x)
             sy = self.ky[i].update(y)
             smoothed.append((sx, sy))
@@ -713,108 +728,272 @@ class RppgProcessor:
         return features, dom_freq
 
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  FACE MESH ROI EXTRACTOR
+#  FACE ROI RESULT  —  typed container for one face's extraction output
+# ══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class FaceRoiResult:
+    """
+    Everything FaceRoiExtractor.extract() returns for a single detected face.
+
+    Attributes
+    ──────────
+    face_id : stable integer ID (persists across frames for the same face)
+    masks   : [forehead_mask, left_cheek_mask, right_cheek_mask]  (uint8)
+    rects   : bounding rect (x1,y1,x2,y2) for each mask above
+    bbox    : overall face bounding box in frame pixel coordinates
+    """
+    face_id : int
+    masks   : List[np.ndarray]
+    rects   : List[Tuple[int, int, int, int]]
+    bbox    : Tuple[int, int, int, int]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FACE TRACK  —  per-face Kalman instance + stable ID bookkeeping
+# ══════════════════════════════════════════════════════════════════════════════
+class FaceTrack:
+    """
+    One entry in FaceRoiExtractor's track pool.
+
+    Each tracked face owns its own LandmarkKalman so that landmark states
+    from different people are NEVER mixed.  IDs are monotonically increasing
+    integers that are never re-used within a session.
+    """
+    _id_counter: int = 0   # class-level counter; incremented on each new track
+
+    def __init__(self, bbox: Tuple[int, int, int, int], ts: float) -> None:
+        FaceTrack._id_counter += 1
+        self.face_id   : int                          = FaceTrack._id_counter
+        self.kalman    : LandmarkKalman               = LandmarkKalman(num_landmarks=468)
+        self.bbox      : Tuple[int, int, int, int]    = bbox   # last matched bbox
+        self.last_seen : float                        = ts     # wall-clock timestamp
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FACE MESH ROI EXTRACTOR  (multi-face, isolated per-face Kalman filters)
 # ══════════════════════════════════════════════════════════════════════════════
 class FaceRoiExtractor:
     """
-    Uses MediaPipe FaceMesh (468 landmarks) to locate and extract three
-    facial ROIs: forehead, left cheek, right cheek.
+    Uses MediaPipe FaceMesh (468 landmarks) to locate and extract forehead +
+    left-cheek + right-cheek ROI masks for EVERY detected face in the frame.
 
-    Motion compensation
-    ───────────────────
-    Landmarks are filtered through per-landmark Kalman stabilisers so that
-    small head movements do not corrupt the ROI pixel extraction.
+    Multi-face design
+    ─────────────────
+    • MediaPipe is configured with max_num_faces = MAX_NUM_FACES (default 4).
+    • Each detected face is matched to an existing FaceTrack via greedy IoU
+      bounding-box matching across frames, giving stable integer IDs.
+    • Every FaceTrack owns its own LandmarkKalman instance — landmark state
+      from face A can never bleed into face B.
+    • Tracks not matched for FACE_TRACK_TIMEOUT seconds are retired and their
+      memory (including the Kalman filter) is freed.
 
-    ROI mask generation
-    ───────────────────
-    For each cluster of landmark indices, a convex hull is computed.  Pixels
-    inside the hull are included in the ROI mask, with a small erosion to
-    exclude edge pixels (better SNR).
+    Returns
+    ───────
+    extract() → List[FaceRoiResult], one entry per detected face (empty list
+    if no face is visible or MediaPipe is unavailable).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_faces: int = MAX_NUM_FACES) -> None:
         if not MEDIAPIPE_OK:
             self.available = False
             return
         self.available = True
+        self.max_faces = max_faces
 
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
-            max_num_faces=1,
+            max_num_faces=max_faces,        # ← was hardcoded 1; now configurable
             refine_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
-
-        all_lm_indices = list(set(
-            FOREHEAD_LANDMARKS + LEFT_CHEEK_LANDMARKS + RIGHT_CHEEK_LANDMARKS
-        ))
-        self.all_lm_indices = sorted(all_lm_indices)
-        self.kalman = LandmarkKalman(num_landmarks=468)
-
-        # Forehead/cheek landmark sets (used to build masks)
-        self.roi_groups = [
+        self.roi_groups: List[List[int]] = [
             FOREHEAD_LANDMARKS,
             LEFT_CHEEK_LANDMARKS,
             RIGHT_CHEEK_LANDMARKS,
         ]
+        # Track pool: face_id → FaceTrack (each with its own Kalman filter)
+        self._tracks: Dict[int, FaceTrack] = {}
 
-    def extract(
+    # ── Property: IDs of all currently live tracks ────────────────────────────
+    @property
+    def active_face_ids(self) -> List[int]:
+        """Return the face IDs of all tracks that have not yet expired."""
+        return list(self._tracks.keys())
+
+    # ── Geometry helpers ──────────────────────────────────────────────────────
+    @staticmethod
+    def _landmarks_to_bbox(
+        lms: List[Tuple[float, float]],
+    ) -> Tuple[int, int, int, int]:
+        """Compute an axis-aligned bounding box from a list of (x, y) points."""
+        xs = [p[0] for p in lms]
+        ys = [p[1] for p in lms]
+        return (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+
+    @staticmethod
+    def _iou(
+        a: Tuple[int, int, int, int],
+        b: Tuple[int, int, int, int],
+    ) -> float:
+        """Intersection-over-Union of two (x1, y1, x2, y2) rectangles."""
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter  = (ix2 - ix1) * (iy2 - iy1)
+        area_a = max((ax2 - ax1) * (ay2 - ay1), 1)
+        area_b = max((bx2 - bx1) * (by2 - by1), 1)
+        return inter / (area_a + area_b - inter)
+
+    # ── Track lifecycle ───────────────────────────────────────────────────────
+    def _match_and_update_tracks(
         self,
-        frame: np.ndarray,
-    ) -> Tuple[List[np.ndarray], List[Tuple[int,int,int,int]]]:
+        bboxes: List[Tuple[int, int, int, int]],
+        now: float,
+    ) -> List[int]:
         """
-        Run FaceMesh on `frame` and return:
-          masks: list of uint8 masks for each ROI group
-          rects: bounding rect for each mask (for visualisation)
+        Greedy IoU matching between current frame's detections and the active
+        track pool.
 
-        Returns ([], []) if no face detected.
+        Algorithm
+        ─────────
+        1. Build an (n_detections × n_tracks) IoU matrix.
+        2. Repeatedly pick the global maximum; if it meets the threshold,
+           link that detection to that track and zero out its row and column
+           to prevent double-assignment.
+        3. Any detection left unmatched gets a brand-new FaceTrack (and
+           therefore a fresh LandmarkKalman).
+
+        Returns a list of face_ids, one per entry in `bboxes`.
+        """
+        track_ids = list(self._tracks.keys())
+        assigned  = [-1] * len(bboxes)
+
+        if track_ids:
+            n_det = len(bboxes)
+            n_trk = len(track_ids)
+            iou_mat = np.zeros((n_det, n_trk), dtype=np.float32)
+            for r, bb in enumerate(bboxes):
+                for c, tid in enumerate(track_ids):
+                    iou_mat[r, c] = self._iou(bb, self._tracks[tid].bbox)
+
+            # Greedy: pick best pair until no IoU ≥ threshold remains
+            while True:
+                r, c = np.unravel_index(np.argmax(iou_mat), iou_mat.shape)
+                if iou_mat[r, c] < FACE_MATCH_IOU_MIN:
+                    break
+                tid             = track_ids[c]
+                assigned[r]     = tid
+                self._tracks[tid].bbox      = bboxes[r]
+                self._tracks[tid].last_seen = now
+                iou_mat[r, :]   = 0.0   # this detection is claimed
+                iou_mat[:, c]   = 0.0   # this track is claimed
+
+        # Unmatched detections → new tracks with fresh Kalman filters
+        for r, fid in enumerate(assigned):
+            if fid == -1:
+                t = FaceTrack(bboxes[r], now)
+                self._tracks[t.face_id] = t
+                assigned[r] = t.face_id
+                log_info(f"FaceRoiExtractor: new face track ID {t.face_id}")
+
+        return assigned
+
+    def _prune_stale_tracks(self, now: float) -> None:
+        """Remove tracks not matched for longer than FACE_TRACK_TIMEOUT."""
+        expired = [
+            fid for fid, t in self._tracks.items()
+            if now - t.last_seen > FACE_TRACK_TIMEOUT
+        ]
+        for fid in expired:
+            log_info(f"FaceRoiExtractor: face track ID {fid} expired")
+            del self._tracks[fid]
+
+    # ── Main extraction ───────────────────────────────────────────────────────
+    def extract(self, frame: np.ndarray) -> List[FaceRoiResult]:
+        """
+        Run FaceMesh on `frame` and return one FaceRoiResult per detected face.
+
+        Steps
+        ─────
+        1. Run MediaPipe FaceMesh → up to MAX_NUM_FACES face landmark sets.
+        2. Convert each face's landmarks to pixel coordinates and compute a
+           bounding box.
+        3. Match bounding boxes to active FaceTrack pool via greedy IoU; create
+           new tracks for unmatched detections.
+        4. For each face, smooth its landmarks through its OWN LandmarkKalman.
+        5. Build forehead / left-cheek / right-cheek convex-hull masks from the
+           smoothed landmarks, applying a small erosion to exclude edge pixels.
+        6. Return a FaceRoiResult per face.
         """
         if not self.available:
-            return [], []
+            return []
 
-        h, w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w   = frame.shape[:2]
+        rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = self.face_mesh.process(rgb)
+        now    = time.time()
 
         if not result.multi_face_landmarks:
-            return [], []
+            self._prune_stale_tracks(now)
+            return []
 
-        face = result.multi_face_landmarks[0]
-
-        # Raw pixel coordinates (all 468 landmarks)
-        raw_lms: List[Tuple[float, float]] = [
-            (lm.x * w, lm.y * h) for lm in face.landmark
+        # ── Step 1 & 2: pixel-space landmarks + bounding boxes ────────────────
+        all_raw_lms: List[List[Tuple[float, float]]] = [
+            [(lm.x * w, lm.y * h) for lm in face.landmark]
+            for face in result.multi_face_landmarks
+        ]
+        all_bboxes: List[Tuple[int, int, int, int]] = [
+            self._landmarks_to_bbox(lms) for lms in all_raw_lms
         ]
 
-        # Kalman-smooth all landmarks
-        smooth_lms = self.kalman.update(raw_lms)
+        # ── Step 3: stable ID assignment ──────────────────────────────────────
+        face_ids = self._match_and_update_tracks(all_bboxes, now)
+        self._prune_stale_tracks(now)
 
-        masks, rects = [], []
-        for group in self.roi_groups:
-            pts = np.array(
-                [(int(smooth_lms[i][0]), int(smooth_lms[i][1])) for i in group],
-                dtype=np.int32,
-            )
-            if len(pts) < 3:
-                continue
+        # ── Steps 4 & 5: per-face Kalman smoothing + ROI mask generation ──────
+        output: List[FaceRoiResult] = []
 
-            # Convex hull mask
-            mask = np.zeros((h, w), dtype=np.uint8)
-            hull = cv2.convexHull(pts)
-            cv2.fillConvexPoly(mask, hull, 255)
+        for det_idx, face_id in enumerate(face_ids):
+            track      = self._tracks[face_id]
+            # Each face uses ONLY its own Kalman filter — no cross-face state
+            smooth_lms = track.kalman.update(all_raw_lms[det_idx])
 
-            # Slight erosion for edge exclusion
-            kernel = np.ones((3, 3), np.uint8)
-            mask = cv2.erode(mask, kernel, iterations=1)
+            masks: List[np.ndarray]             = []
+            rects: List[Tuple[int, int, int, int]] = []
 
-            # Bounding rect for display
-            x, y, bw, bh = cv2.boundingRect(hull)
-            masks.append(mask)
-            rects.append((x, y, x + bw, y + bh))
+            for group in self.roi_groups:
+                pts = np.array(
+                    [(int(smooth_lms[i][0]), int(smooth_lms[i][1]))
+                     for i in group],
+                    dtype=np.int32,
+                )
+                if len(pts) < 3:
+                    continue
 
-        return masks, rects
+                mask = np.zeros((h, w), dtype=np.uint8)
+                hull = cv2.convexHull(pts)
+                cv2.fillConvexPoly(mask, hull, 255)
+                # Slight erosion: exclude noisy edge pixels for better SNR
+                mask = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=1)
+
+                bx, by, bw, bh = cv2.boundingRect(hull)
+                masks.append(mask)
+                rects.append((bx, by, bx + bw, by + bh))
+
+            output.append(FaceRoiResult(
+                face_id=face_id,
+                masks=masks,
+                rects=rects,
+                bbox=all_bboxes[det_idx],
+            ))
+
+        return output
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1206,10 +1385,17 @@ def draw_spo2_panel(
     rppg: RppgProcessor,
     roi_rects: List[Tuple[int,int,int,int]],
     show_rois: bool,
+    face_id: int = 0,
+    face_bbox: Optional[Tuple[int, int, int, int]] = None,
 ) -> None:
     """
-    Draw the SpO₂ / HR panel in the bottom-left corner.
-    Also outlines face ROI rectangles if show_rois is True.
+    Draw the SpO₂ / HR panel for one face.
+
+    Positioning
+    ───────────
+    When face_bbox is provided the panel is anchored just below that face's
+    bounding box (clamped to frame bounds).  Without it the panel falls back
+    to the bottom-left corner — preserving the original single-face behaviour.
     """
     h, w = frame.shape[:2]
 
@@ -1225,18 +1411,29 @@ def draw_spo2_panel(
     qual_str = f"SQ: {quality * 100:.0f}%"
 
     lines = [
-        ("SpO2 Monitor",  C_YELLOW),
+        (f"SpO\u2082  Face {face_id}", C_YELLOW),   # "SpO₂  Face N"
         (spo2_str,        spo2_col if not collecting else C_GRAY),
         (f"HR: {hr_str}", C_WHITE),
         (qual_str,        C_CYAN),
     ]
     if spo2_val > 0 and spo2_val < 94.0:
-        lines.append(("!! LOW SpO2 !!", C_ALERT))
+        lines.append(("!! LOW SpO\u2082 !!", C_ALERT))
 
-    PAD = 8; LINE_H = 22; PW = 170
+    PAD = 8; LINE_H = 22; PW = 178
     PH = len(lines) * LINE_H + PAD * 2
-    px1, py1 = 10, h - PH - 10
-    px2, py2 = px1 + PW, h - 10
+
+    # Anchor: just below the face bbox when available, else bottom-left corner
+    if face_bbox is not None:
+        _fx1, _fy1, _fx2, fy2 = face_bbox
+        px1 = max(_fx1, 0)
+        py1 = max(min(fy2 + 6, h - PH - 4), 0)
+    else:
+        px1 = 10
+        py1 = h - PH - 10
+
+    px2 = min(px1 + PW, w - 1)
+    py2 = min(py1 + PH, h - 1)
+
     _alpha_rect(frame, px1, py1, px2, py2, C_DARK, alpha=0.75)
 
     for i, (text, color) in enumerate(lines):
@@ -1244,7 +1441,7 @@ def draw_spo2_panel(
         cv2.putText(frame, text, (px1 + PAD, ty),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
 
-    # ROI outlines
+    # ROI outlines (only when the face is actively in the frame)
     if show_rois:
         roi_labels = ["Forehead", "L-Cheek", "R-Cheek"]
         for idx, rect in enumerate(roi_rects):
@@ -1369,9 +1566,9 @@ def main() -> None:
     else:
         log_warning("YOLO unavailable — fall detection disabled.")
 
-    face_extractor = FaceRoiExtractor()
-    rppg           = RppgProcessor()
-    physnet        = PhysNetLite()   # optional DL backend (unused unless wired in)
+    face_extractor = FaceRoiExtractor()          # multi-face, per-face Kalman
+    rppg           = RppgProcessor()             # kept for backward compat (unused below)
+    physnet        = PhysNetLite()               # optional DL backend
 
     if not face_extractor.available:
         log_warning("MediaPipe unavailable — SpO₂ module disabled.")
@@ -1393,11 +1590,14 @@ def main() -> None:
     print()
 
     # ── State ─────────────────────────────────────────────────────────────────
-    person_states: Dict[int, PersonState] = {}
-    fps           = 0.0
-    frame_times:  deque = deque(maxlen=30)
-    show_spo2     = True
-    roi_rects: List[Tuple[int,int,int,int]] = []
+    person_states : Dict[int, PersonState]    = {}
+    fps            = 0.0
+    frame_times  : deque                      = deque(maxlen=30)
+    show_spo2      = True
+    # Multi-face r-PPG: one RppgProcessor per live face track ID
+    rppg_pool    : Dict[int, RppgProcessor]   = {}
+    # Latest per-face extraction output (used by both MODULE 2 and the HUD)
+    face_results : List[FaceRoiResult]        = []
 
     # SpO₂ update throttle (run expensive processing every N frames)
     SPO2_UPDATE_INTERVAL = 15   # ~0.5 s at 30 fps
@@ -1462,45 +1662,68 @@ def main() -> None:
 
             cleanup_stale_persons(person_states, active_ids, now)
 
-        # ── MODULE 2: r-PPG / SpO₂ ────────────────────────────────────────────
+        # ── MODULE 2: r-PPG / SpO₂  (multi-face) ─────────────────────────────
         if face_extractor.available and show_spo2:
-            masks, roi_rects = face_extractor.extract(frame)
+            face_results = face_extractor.extract(frame)
 
-            if masks:
-                # Compute mean RGB per ROI and push to processor
-                h_f, w_f = frame.shape[:2]
+            for fr in face_results:
+                # Lazily create a dedicated RppgProcessor for each new face
+                if fr.face_id not in rppg_pool:
+                    rppg_pool[fr.face_id] = RppgProcessor()
+                    log_info(f"SpO\u2082: new processor for face ID {fr.face_id}")
+
+                face_rppg = rppg_pool[fr.face_id]
+
+                # Compute mean RGB across this face's ROI masks and push
                 r_vals, g_vals, b_vals = [], [], []
-                for mask in masks:
+                for mask in fr.masks:
                     px = frame[mask > 0]
                     if px.size:
-                        b_vals.append(float(px[:, 0].mean()))
+                        b_vals.append(float(px[:, 0].mean()))  # OpenCV is BGR
                         g_vals.append(float(px[:, 1].mean()))
                         r_vals.append(float(px[:, 2].mean()))
 
                 if r_vals:
-                    rppg.push_frame_direct(
-                        np.mean(r_vals),
-                        np.mean(g_vals),
-                        np.mean(b_vals),
+                    face_rppg.push_frame_direct(
+                        float(np.mean(r_vals)),
+                        float(np.mean(g_vals)),
+                        float(np.mean(b_vals)),
                     )
 
-                # ROI rect visualisation
-                for rect in roi_rects:
-                    rx1, ry1, rx2, ry2 = rect
+                # Draw ROI bounding rects directly on the frame
+                for rx1, ry1, rx2, ry2 in fr.rects:
                     cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), C_ROI, 1)
 
-            # Throttled SpO₂ update
+            # Throttled SpO₂ update — run for every active face
             spo2_frame_counter += 1
             if spo2_frame_counter >= SPO2_UPDATE_INTERVAL:
                 spo2_frame_counter = 0
-                rppg.process(fps=fps if fps > 5 else RPPG_ASSUMED_FPS)
+                for face_rppg in rppg_pool.values():
+                    face_rppg.process(fps=fps if fps > 5 else RPPG_ASSUMED_FPS)
+
+            # Prune RppgProcessor entries whose face track has expired, so
+            # stale signal buffers don't accumulate for unseen people
+            live_ids   = set(face_extractor.active_face_ids)
+            stale_fids = [fid for fid in rppg_pool if fid not in live_ids]
+            for fid in stale_fids:
+                log_info(f"SpO\u2082: pruning processor for expired face ID {fid}")
+                del rppg_pool[fid]
 
         # ── Global overlays ───────────────────────────────────────────────────
         draw_global_hud(frame, person_states, fps)
         draw_major_alert_overlay(frame, person_states, now)
 
         if show_spo2 and face_extractor.available:
-            draw_spo2_panel(frame, rppg, roi_rects, show_rois=True)
+            for fr in face_results:
+                if fr.face_id in rppg_pool:
+                    draw_spo2_panel(
+                        frame,
+                        rppg_pool[fr.face_id],
+                        fr.rects,
+                        show_rois=True,
+                        face_id=fr.face_id,
+                        face_bbox=fr.bbox,
+                    )
 
         # ── FPS ───────────────────────────────────────────────────────────────
         frame_times.append(now)
