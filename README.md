@@ -52,3 +52,4 @@ Constraints & Code Style:
 - Configuration thresholds (angle bounds, velocity limits, window sizes) must be cleanly contained in a @dataclass.
 
 Provide the complete code in a single file that can be directly dropped into an active OpenCV/YOLOv8 loop.
+1. colab research for llm fine tuning with image
