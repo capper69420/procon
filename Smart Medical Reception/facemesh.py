@@ -1,651 +1,557 @@
 """
-facemesh_pain_scorer.py
-========================
-Kosen Procon — Smart Medical Reception Kiosk
-AI/ML Module: Visual Pain Assessment via MediaPipe FaceMesh
+facemesh.py — FaceMesh ROI extraction + r-PPG vitals for API use.
 
-Architecture:
-    MediaPipe FaceMesh (468 landmarks)
-          ↓
-    Geometric Feature Extraction  (6 features per frame)
-          ↓
-    Calibration Normalization     (personal neutral-face baseline, ~1.5s)
-          ↓
-    PSPI-inspired AU Weighting    (Action Unit proxy scores 0–1)
-          ↓
-    Rolling Window + Kalman Smoothing
-          ↓
-    Pain Score 0–10 + Level Label
-
-Pain-Correlated Action Units (Facial Action Coding System):
-    AU4   Brow Lowerer      — corrugator supercilii activation (furrowing)
-    AU7   Lid Tightener     — orbicularis oculi palpebral (squinting)
-    AU9   Nose Wrinkler     — levator labii superioris alaeque nasi
-    AU20  Lip Stretcher     — risorius / platysma (horizontal grimace)
-    AU25  Lips Part         — depressor labii (mouth opening)
-    AU43  Eyes Closed       — full/partial eye closure
-
-PSPI Formula (Prkachin & Solomon, 2008):
-    pain = AU4 + max(AU6, AU7) + max(AU9, AU10) + AU43
-
-This implementation adapts that formula to landmark geometry:
-    pain_score = Σ w_i · au_i,   normalized → 0–10
-
-Author:   AI/ML Engineer, Smart Reception Team
-Version:  1.0.0
-
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
-.\env12\Scripts\Activate.ps1
+Extracted from health_monitor.py for the FastAPI backend.
+Processes single frames (numpy BGR arrays or base64 strings).
 """
 
 from __future__ import annotations
 
-import numpy as np # type: ignore
+import base64
+import math
+import time
+import warnings
 from dataclasses import dataclass, field
-from collections import deque
-from typing import Optional, Sequence
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LANDMARK INDEX DEFINITIONS
-# MediaPipe FaceMesh 468-point canonical model.
-# Adjust indices here only if mediapipe version changes.
-# Reference: https://github.com/google/mediapipe/blob/master/mediapipe/modules/
-#            face_geometry/data/canonical_face_model_uv_visualization.png
-# ══════════════════════════════════════════════════════════════════════════════
-
-@dataclass(frozen=True)
-class _FaceLandmarks:
-    """
-    Landmark indices for pain-relevant facial regions.
-    All values are indices into `face_results.multi_face_landmarks[i].landmark`.
-    """
-
-    # ── Eyes ── (Eye Aspect Ratio: outer, upper×2, inner, lower×2)
-    LEFT_EYE_EAR:  tuple = (33,  160, 158, 133, 153, 144)
-    RIGHT_EYE_EAR: tuple = (362, 385, 387, 263, 373, 380)
-
-    # ── Eyebrows ── (for AU4 brow-to-eye vertical gap)
-    LEFT_INNER_BROW:  int = 107   # Nasal-side brow anchor (person's right eye side)
-    RIGHT_INNER_BROW: int = 336   # Nasal-side brow anchor (person's left eye side)
-    LEFT_EYE_INNER:   int = 133   # Inner corner of person's right eye
-    RIGHT_EYE_INNER:  int = 362   # Inner corner of person's left eye
-
-    # ── Nose ── (for AU9 nose-wing spread)
-    LEFT_NOSTRIL:   int = 129     # Left alar landmark
-    RIGHT_NOSTRIL:  int = 358     # Right alar landmark
-
-    # ── Mouth ── (for AU20 horizontal stretch + AU25 vertical opening)
-    MOUTH_LEFT:     int = 61      # Left mouth corner
-    MOUTH_RIGHT:    int = 291     # Right mouth corner
-    UPPER_LIP_IN:   int = 13      # Inner upper lip midpoint
-    LOWER_LIP_IN:   int = 14      # Inner lower lip midpoint
-
-    # ── Face dimension anchors ── (normalization)
-    FOREHEAD:       int = 10
-    CHIN:           int = 152
-
-
-FL = _FaceLandmarks()   # Module-level singleton — import this in other files
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class PainScoringConfig:
-    """
-    All numeric constants for the scorer in one place.
-    Tune these during validation with real patient expressions.
-    """
-
-    # ── PSPI-inspired AU weights ──────────────────────────────────────────────
-    # Higher weight = that AU contributes more to the final pain score.
-    # Calibrated to approximate clinical PSPI scale (0–16 internally, mapped 0–10).
-    w_au4_brow:        float = 2.5   # Brow lowering — strongest single pain indicator
-    w_au43_eye:        float = 2.0   # Eye squinting / closure
-    w_au9_nose:        float = 1.5   # Nose wrinkling
-    w_au20_grimace:    float = 1.5   # Horizontal mouth stretch (grimace)
-    w_au25_lip:        float = 1.0   # Lip parting
-    w_bilateral_bonus: float = 0.5   # Bonus when brow lowering is bilateral (symmetrical)
-
-    # ── AU activation sensitivity ─────────────────────────────────────────────
-    # These define the fraction-of-face-height delta that corresponds to full
-    # AU activation (score = 1.0). Smaller → more sensitive.
-    brow_delta_max:  float = 0.06   # 6% of face height → max AU4 score
-    ear_delta_max:   float = 0.12   # 12% relative EAR drop → max AU43 score
-    nose_delta_max:  float = 0.04
-    mouth_v_max:     float = 0.05   # Vertical lip separation
-    grimace_ratio_max: float = 0.08  # Ratio shift for horizontal grimace
-
-    # ── Calibration ───────────────────────────────────────────────────────────
-    calibration_frames: int   = 45     # ~1.5s at 30fps (patient "looks at camera")
-    calib_trim_pct:     float = 0.10   # Remove top+bottom 10% before computing mean
-
-    # ── Temporal smoothing ────────────────────────────────────────────────────
-    window_size:        int   = 15     # Rolling window (frames) before Kalman input
-    kalman_Q:           float = 0.08   # Process noise (how fast signal can change)
-    kalman_R:           float = 0.40   # Measurement noise (how noisy raw score is)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DATA CLASSES (OUTPUT)
-# ══════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class AUScores:
-    """Individual Action Unit proxy scores. Each value ∈ [0, 1]."""
-    au4_brow_lowering:  float = 0.0
-    au43_eye_closure:   float = 0.0
-    au9_nose_wrinkle:   float = 0.0
-    au20_grimace:       float = 0.0
-    au25_lip_part:      float = 0.0
-    bilateral_bonus:    float = 0.0
-
-    def to_dict(self) -> dict:
-        return {
-            "AU4":  round(self.au4_brow_lowering, 3),
-            "AU43": round(self.au43_eye_closure, 3),
-            "AU9":  round(self.au9_nose_wrinkle, 3),
-            "AU20": round(self.au20_grimace, 3),
-            "AU25": round(self.au25_lip_part, 3),
-            "bilateral_bonus": round(self.bilateral_bonus, 3),
-        }
-
-
-@dataclass
-class PainScoreResult:
-    """Complete output from a single FaceMeshPainScorer.score() call."""
-    pain_score:           float    # Final smoothed score ∈ [0, 10]
-    pain_score_raw:       float    # Instantaneous unsmoothed score ∈ [0, 10]
-    pain_level:           str      # 'none'|'mild'|'moderate'|'severe'|'extreme'
-    au_scores:            AUScores # Per-AU breakdown for dashboard display
-    is_calibrated:        bool     # False during first ~45 frames (show UI progress)
-    calibration_progress: float    # 0.0→1.0 (percentage complete)
-    face_size_norm:       float    # Normalized face height (quality check; < 0.2 = too far)
-
-    def to_api_dict(self) -> dict:
-        """Serialize for FastAPI response / Supabase insert."""
-        return {
-            "pain_score":           round(self.pain_score, 2),
-            "pain_score_raw":       round(self.pain_score_raw, 2),
-            "pain_level":           self.pain_level,
-            "face_action_units":    self.au_scores.to_dict(),
-            "is_calibrated":        self.is_calibrated,
-            "calibration_progress": round(self.calibration_progress, 2),
-        }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# KALMAN SMOOTHER
-# ══════════════════════════════════════════════════════════════════════════════
-
-class KalmanSmoother1D:
-    """
-    Minimal 1-D Kalman filter for scalar time-series smoothing.
-
-    Purpose: Prevents momentary facial expression spikes (blink, cough) from
-    triggering false Level-C escalations. The filter "believes" the signal
-    changes smoothly over time (Q) and that individual measurements are noisy (R).
-
-    Higher Q → faster response to real pain escalation.
-    Higher R → smoother output but slower to react.
-    """
-
-    def __init__(self, Q: float = 0.08, R: float = 0.40):
-        self.Q = Q        # Process noise variance
-        self.R = R        # Measurement noise variance
-        self._x = 0.0     # State estimate
-        self._P = 1.0     # Estimate error covariance
-        self._init = False
-
-    def update(self, z: float) -> float:
-        """Feed one measurement, get back the filtered estimate."""
-        if not self._init:
-            self._x = z
-            self._init = True
-            return z
-
-        # ── Predict ────────────────────────────────────────────
-        P_pred = self._P + self.Q
-
-        # ── Update (Kalman gain) ────────────────────────────────
-        K = P_pred / (P_pred + self.R)          # Kalman gain ∈ [0, 1]
-        self._x = self._x + K * (z - self._x)  # Corrected estimate
-        self._P = (1.0 - K) * P_pred            # Updated covariance
-
-        return float(self._x)
-
-    def reset(self):
-        self._x = 0.0
-        self._P = 1.0
-        self._init = False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# GEOMETRY HELPERS (module-level, no state)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _dist(a, b) -> float:
-    """Euclidean distance between two MediaPipe NormalizedLandmark objects."""
-    return float(np.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2))
-
-
-def _eye_aspect_ratio(lm: Sequence, indices: tuple) -> float:
-    """
-    Eye Aspect Ratio (EAR) — Soukupová & Čech, 2016.
-
-        EAR = (‖p2−p6‖ + ‖p3−p5‖) / (2 · ‖p1−p4‖)
-
-    Interpretation:
-        Open eye  (neutral): EAR ≈ 0.25–0.32
-        Squinting (pain):    EAR ≈ 0.15–0.22
-        Closed:              EAR ≈ 0.05
-
-    Args:
-        lm:      Full landmark list (lm[i] = NormalizedLandmark)
-        indices: (p1, p2, p3, p4, p5, p6) — see LEFT_EYE_EAR / RIGHT_EYE_EAR
-    """
-    p1, p2, p3, p4, p5, p6 = [lm[i] for i in indices]
-    A = _dist(p2, p6)
-    B = _dist(p3, p5)
-    C = _dist(p1, p4)
-    return (A + B) / (2.0 * C + 1e-8)
-
-
-def _trimmed_mean(values: list[float], trim_pct: float = 0.10) -> float:
-    """Mean after removing top and bottom trim_pct fraction. More robust than raw mean."""
-    n = len(values)
-    if n == 0:
-        return 0.0
-    k = max(1, int(n * trim_pct))
-    trimmed = sorted(values)[k:-k] if k < n // 2 else values
-    return float(np.mean(trimmed))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN SCORER CLASS
-# ══════════════════════════════════════════════════════════════════════════════
-
-class FaceMeshPainScorer:
-    """
-    Converts MediaPipe FaceMesh landmark output to a calibrated 0–10 pain score.
-
-    Lifecycle per patient:
-        1. Patient steps in front of kiosk.
-        2. Call reset() to clear the previous patient's calibration.
-        3. Call score() once per frame in your video loop.
-        4. During the first ~1.5 s (calibration_frames), is_calibrated = False
-           and the score is meaningless — show a "Please look at the camera" UI.
-        5. After calibration, scores are reliable and Kalman-smoothed.
-        6. After the session, query get_session_stats() for the Supabase insert.
-
-    Example (single-face kiosk):
-        scorer = FaceMeshPainScorer()
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            if not results.multi_face_landmarks:
-                continue
-            result = scorer.score(results.multi_face_landmarks[0].landmark)
-            print(f"Pain: {result.pain_score:.1f}/10  [{result.pain_level}]  "
-                  f"AU4={result.au_scores.au4_brow_lowering:.2f}  "
-                  f"Calib: {result.calibration_progress*100:.0f}%")
-    """
-
-    def __init__(self, config: Optional[PainScoringConfig] = None):
-        self.cfg = config or PainScoringConfig()
-
-        # ── Calibration buffers ────────────────────────────────
-        self._cal: dict[str, list[float]] = {
-            "ear_l": [], "ear_r": [], "brow": [],
-            "nose":  [], "mouth_v": [], "mouth_h": [],
-        }
-        # Calibrated baselines (means from neutral-face frames)
-        self._base: dict[str, Optional[float]] = {k: None for k in self._cal}
-        self.is_calibrated: bool = False
-
-        # ── Smoothing ──────────────────────────────────────────
-        self._window:  deque = deque(maxlen=self.cfg.window_size)
-        self._kalman:  KalmanSmoother1D = KalmanSmoother1D(
-            Q=self.cfg.kalman_Q, R=self.cfg.kalman_R
-        )
-
-        # ── Session statistics (for Supabase insert at session end) ─
-        self._frame_count:   int   = 0
-        self._score_history: deque = deque(maxlen=300)  # ~10s at 30fps
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # PUBLIC API
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def score(self, landmarks) -> PainScoreResult:
-        """
-        Main entry point. Call once per face per frame.
-
-        Args:
-            landmarks: face_results.multi_face_landmarks[0].landmark
-                       (NormalizedLandmarkList of 468 points)
-
-        Returns:
-            PainScoreResult — safe to read during/after calibration.
-        """
-        lm = landmarks
-        self._frame_count += 1
-
-        # ── 1. Face size (quality + normalization denominator) ──
-        face_h = _dist(lm[FL.FOREHEAD], lm[FL.CHIN])
-
-        # ── 2. Extract raw geometric features ──────────────────
-        ear_l   = _eye_aspect_ratio(lm, FL.LEFT_EYE_EAR)
-        ear_r   = _eye_aspect_ratio(lm, FL.RIGHT_EYE_EAR)
-        brow_d  = self._feat_brow(lm, face_h)
-        nose_d  = self._feat_nose(lm, face_h)
-        mouth_v = self._feat_mouth_vertical(lm, face_h)
-        mouth_h = self._feat_mouth_horizontal(lm, face_h)
-
-        # ── 3. Feed calibration buffers ─────────────────────────
-        self._calibrate(ear_l, ear_r, brow_d, nose_d, mouth_v, mouth_h)
-        calib_progress = min(1.0, len(self._cal["ear_l"]) / self.cfg.calibration_frames)
-
-        # ── 4. Compute AU proxy scores ──────────────────────────
-        au = self._compute_aus(ear_l, ear_r, brow_d, nose_d, mouth_v, mouth_h)
-
-        # ── 5. Weighted PSPI-inspired sum → normalize to 0–10 ──
-        cfg = self.cfg
-        total_weight = (
-            cfg.w_au4_brow + cfg.w_au43_eye + cfg.w_au9_nose +
-            cfg.w_au20_grimace + cfg.w_au25_lip + cfg.w_bilateral_bonus
-        )
-        weighted_sum = (
-            au.au4_brow_lowering * cfg.w_au4_brow   +
-            au.au43_eye_closure  * cfg.w_au43_eye    +
-            au.au9_nose_wrinkle  * cfg.w_au9_nose    +
-            au.au20_grimace      * cfg.w_au20_grimace +
-            au.au25_lip_part     * cfg.w_au25_lip    +
-            au.bilateral_bonus   * cfg.w_bilateral_bonus
-        )
-        raw_10 = float(np.clip(weighted_sum / total_weight * 10.0, 0.0, 10.0))
-
-        if not self.is_calibrated:
-            raw_10 = 0.0     # Don't emit scores until baseline is established
-
-        # ── 6. Rolling-window average → Kalman smooth ───────────
-        self._window.append(raw_10)
-        windowed  = float(np.mean(self._window))
-        smoothed  = float(np.clip(self._kalman.update(windowed), 0.0, 10.0))
-
-        self._score_history.append(smoothed)
-
-        return PainScoreResult(
-            pain_score           = round(smoothed, 2),
-            pain_score_raw       = round(raw_10,  2),
-            pain_level           = self._level_label(smoothed),
-            au_scores            = au,
-            is_calibrated        = self.is_calibrated,
-            calibration_progress = round(calib_progress, 3),
-            face_size_norm       = round(face_h, 4),
-        )
-
-    def reset(self):
-        """
-        Reset for a new patient session.
-        Call this every time a new patient steps up to the kiosk.
-        """
-        for lst in self._cal.values():
-            lst.clear()
-        for k in self._base:
-            self._base[k] = None
-        self.is_calibrated = False
-        self._window.clear()
-        self._kalman.reset()
-        self._frame_count = 0
-        self._score_history.clear()
-
-    def get_session_peak(self) -> float:
-        """Peak pain score during the session. Insert into Supabase at session end."""
-        return float(max(self._score_history)) if self._score_history else 0.0
-
-    def get_session_mean(self) -> float:
-        """Mean pain score across the session (post-calibration)."""
-        return float(np.mean(list(self._score_history))) if self._score_history else 0.0
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # FEATURE EXTRACTION  (private)
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _feat_brow(self, lm, face_h: float) -> float:
-        """
-        AU4 geometry: average vertical distance from inner eyebrow to inner eye corner,
-        normalized by face height.
-
-        Coordinate note: MediaPipe y=0 is TOP of image, y=1 is BOTTOM.
-        Eyebrow y < Eye y in normal state (brow above eye).
-        When brow lowers toward eye (AU4), (eye.y - brow.y) DECREASES.
-        """
-        left_gap  = (lm[FL.LEFT_EYE_INNER].y  - lm[FL.LEFT_INNER_BROW].y)  / (face_h + 1e-8)
-        right_gap = (lm[FL.RIGHT_EYE_INNER].y - lm[FL.RIGHT_INNER_BROW].y) / (face_h + 1e-8)
-        return float((left_gap + right_gap) / 2.0)
-
-    def _feat_brow_bilateral(self, lm, face_h: float) -> tuple[float, float]:
-        """Returns (left_gap, right_gap) separately for bilateral symmetry check."""
-        left  = (lm[FL.LEFT_EYE_INNER].y  - lm[FL.LEFT_INNER_BROW].y)  / (face_h + 1e-8)
-        right = (lm[FL.RIGHT_EYE_INNER].y - lm[FL.RIGHT_INNER_BROW].y) / (face_h + 1e-8)
-        return float(left), float(right)
-
-    def _feat_nose(self, lm, face_h: float) -> float:
-        """
-        AU9 geometry: horizontal spread of nose wings, normalized by face height.
-        Nasal wrinkling causes slight lateral displacement of alar landmarks.
-        """
-        return float(_dist(lm[FL.LEFT_NOSTRIL], lm[FL.RIGHT_NOSTRIL]) / (face_h + 1e-8))
-
-    def _feat_mouth_vertical(self, lm, face_h: float) -> float:
-        """AU25 geometry: inner-lip vertical gap normalized by face height."""
-        return float(_dist(lm[FL.UPPER_LIP_IN], lm[FL.LOWER_LIP_IN]) / (face_h + 1e-8))
-
-    def _feat_mouth_horizontal(self, lm, face_h: float) -> float:
-        """AU20 geometry: mouth-corner horizontal distance normalized by face height."""
-        return float(_dist(lm[FL.MOUTH_LEFT], lm[FL.MOUTH_RIGHT]) / (face_h + 1e-8))
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # CALIBRATION  (private)
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _calibrate(self, ear_l, ear_r, brow, nose, mouth_v, mouth_h):
-        """
-        Accumulate neutral-face frames to build personal baseline.
-        Using the patient's OWN neutral face removes inter-person geometry bias.
-        (A naturally narrow-eyed person should not score higher than a wide-eyed one.)
-        """
-        if self.is_calibrated:
-            return
-
-        self._cal["ear_l"].append(ear_l)
-        self._cal["ear_r"].append(ear_r)
-        self._cal["brow"].append(brow)
-        self._cal["nose"].append(nose)
-        self._cal["mouth_v"].append(mouth_v)
-        self._cal["mouth_h"].append(mouth_h)
-
-        if len(self._cal["brow"]) >= self.cfg.calibration_frames:
-            t = self.cfg.calib_trim_pct
-            for k, vals in self._cal.items():
-                self._base[k] = _trimmed_mean(vals, t)
-            self.is_calibrated = True
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # AU SCORE COMPUTATION  (private)
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _compute_aus(
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+from scipy import signal as scipy_signal
+from scipy.signal import butter, filtfilt, detrend
+
+warnings.filterwarnings("ignore")
+
+try:
+    import mediapipe as mp
+    MEDIAPIPE_OK = True
+except ImportError:
+    MEDIAPIPE_OK = False
+
+try:
+    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    SKLEARN_OK = True
+except ImportError:
+    SKLEARN_OK = False
+
+try:
+    from ultralytics import YOLO
+    YOLO_OK = True
+except ImportError:
+    YOLO_OK = False
+
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+FOREHEAD_LANDMARKS = [10, 67, 69, 104, 108, 151, 337, 338, 297, 299]
+LEFT_CHEEK_LANDMARKS = [234, 93, 132, 58, 172, 136, 150, 149, 176, 148]
+RIGHT_CHEEK_LANDMARKS = [454, 323, 361, 288, 397, 365, 379, 378, 400, 377]
+ROI_LANDMARK_INDICES: Tuple[int, ...] = tuple(sorted({
+    *FOREHEAD_LANDMARKS, *LEFT_CHEEK_LANDMARKS, *RIGHT_CHEEK_LANDMARKS,
+}))
+
+_ERODE_KERNEL = np.ones((3, 3), dtype=np.uint8)
+RPPG_BUFFER_FRAMES = 300
+RPPG_BPF_LOW = 0.7
+RPPG_BPF_HIGH = 4.0
+RPPG_MIN_FRAMES = 90
+RPPG_ASSUMED_FPS = 30.0
+SPO2_SMOOTH_ALPHA = 0.15
+MAX_NUM_FACES = 4
+FACE_MATCH_IOU_MIN = 0.25
+FACE_TRACK_TIMEOUT = 2.0
+KALMAN_PROCESS_NOISE = 1e-5
+KALMAN_MEASURE_NOISE = 1e-3
+
+FALLEN_TRUNK_DEG = 55
+UPRIGHT_TRUNK_DEG = 35
+FALLEN_BBOX_RATIO = 1.25
+STANDING_BBOX_RATIO = 1.50
+KP_MIN_CONF = 0.30
+
+YOLO_MODEL = "yolo11n-pose.pt"
+
+
+class Posture:
+    STANDING = "STANDING"
+    SITTING = "SITTING"
+    FALLEN = "FALLEN"
+    UNKNOWN = "UNKNOWN"
+
+
+# ── Kalman helpers ────────────────────────────────────────────────────────────
+class KalmanStabiliser:
+    def __init__(
         self,
-        ear_l: float, ear_r: float,
-        brow:  float, nose: float,
-        mouth_v: float, mouth_h: float,
-    ) -> AUScores:
-        """
-        Convert geometric features to Action Unit scores ∈ [0, 1].
-        Returns zero-valued AUScores if not yet calibrated.
-        """
-        if not self.is_calibrated:
-            return AUScores()
+        process_noise: float = KALMAN_PROCESS_NOISE,
+        measure_noise: float = KALMAN_MEASURE_NOISE,
+    ) -> None:
+        self.Q = process_noise
+        self.R = measure_noise
+        self.x = 0.0
+        self.P = 1.0
+        self._initialised = False
 
-        cfg = self.cfg
-        b   = self._base     # Shorthand for baselines
+    def update(self, measurement: float) -> float:
+        if not self._initialised:
+            self.x = measurement
+            self._initialised = True
+            return self.x
+        p_pred = self.P + self.Q
+        k = p_pred / (p_pred + self.R)
+        self.x = self.x + k * (measurement - self.x)
+        self.P = (1.0 - k) * p_pred
+        return self.x
 
-        # ── AU43 / AU7 — Eye squinting ────────────────────────────────────────
-        # EAR drops from baseline when patient squints in pain.
-        ear_drop_l = (b["ear_l"] - ear_l) / (cfg.ear_delta_max + 1e-8)
-        ear_drop_r = (b["ear_r"] - ear_r) / (cfg.ear_delta_max + 1e-8)
-        au43 = float(np.clip((ear_drop_l + ear_drop_r) / 2.0, 0.0, 1.0))
 
-        # ── AU4 — Brow lowering ───────────────────────────────────────────────
-        # Brow-eye gap decreases when brows furrow toward midline.
-        brow_drop = (b["brow"] - brow) / (cfg.brow_delta_max + 1e-8)
-        au4 = float(np.clip(brow_drop, 0.0, 1.0))
+class LandmarkKalman:
+    def __init__(self, indices: Tuple[int, ...] = ROI_LANDMARK_INDICES) -> None:
+        self._indices = indices
+        self.kx: Dict[int, KalmanStabiliser] = {i: KalmanStabiliser() for i in indices}
+        self.ky: Dict[int, KalmanStabiliser] = {i: KalmanStabiliser() for i in indices}
 
-        # Bilateral bonus: genuine pain expression is symmetrical.
-        # Unilateral brow lowering is more likely skepticism/thinking.
-        # Award a bonus only when au4 is already significant (> 0.35).
-        bilateral_bonus = float(np.clip(au4 - 0.35, 0.0, 0.65)) if au4 > 0.35 else 0.0
+    def update(self, lm_list: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        out = list(lm_list)
+        for i in self._indices:
+            if i >= len(lm_list):
+                continue
+            x, y = lm_list[i]
+            out[i] = (self.kx[i].update(x), self.ky[i].update(y))
+        return out
 
-        # ── AU9 — Nose wrinkling ──────────────────────────────────────────────
-        # Nostril wings spread slightly when levator labii activates.
-        nose_spread = (nose - b["nose"]) / (cfg.nose_delta_max + 1e-8)
-        au9 = float(np.clip(nose_spread, 0.0, 1.0))
 
-        # ── AU25 — Lip parting ────────────────────────────────────────────────
-        # Vertical lip gap increases when lips part in pain/distress.
-        lip_open = (mouth_v - b["mouth_v"]) / (cfg.mouth_v_max + 1e-8)
-        au25 = float(np.clip(lip_open, 0.0, 1.0))
+@dataclass
+class FaceRoiResult:
+    face_id: int
+    masks: List[np.ndarray]
+    rects: List[Tuple[int, int, int, int]]
+    bbox: Tuple[int, int, int, int]
 
-        # ── AU20 — Grimace (horizontal lip stretch) ───────────────────────────
-        # Pain grimace widens the mouth horizontally without opening vertically.
-        # Metric: the mouth_v / mouth_h ratio drops vs neutral (wider, not taller).
-        ratio_base    = b["mouth_v"] / (b["mouth_h"] + 1e-8)
-        ratio_current = mouth_v      / (mouth_h      + 1e-8)
-        grimace_shift = (ratio_base - ratio_current) / (cfg.grimace_ratio_max + 1e-8)
-        au20 = float(np.clip(grimace_shift, 0.0, 1.0))
+    def mean_rgb(self, frame: np.ndarray) -> Optional[Tuple[float, float, float]]:
+        r_vals, g_vals, b_vals = [], [], []
+        for mask, (x1, y1, x2, y2) in zip(self.masks, self.rects):
+            if mask is None or mask.size == 0:
+                continue
+            patch = frame[y1:y2, x1:x2]
+            if patch.size == 0:
+                continue
+            pixels = patch[mask > 0]
+            if pixels.size == 0:
+                continue
+            b_vals.append(float(pixels[:, 0].mean()))
+            g_vals.append(float(pixels[:, 1].mean()))
+            r_vals.append(float(pixels[:, 2].mean()))
+        if not r_vals:
+            return None
+        return (float(np.mean(r_vals)), float(np.mean(g_vals)), float(np.mean(b_vals)))
 
-        return AUScores(
-            au4_brow_lowering = round(au4,       3),
-            au43_eye_closure  = round(au43,      3),
-            au9_nose_wrinkle  = round(au9,       3),
-            au20_grimace      = round(au20,      3),
-            au25_lip_part     = round(au25,      3),
-            bilateral_bonus   = round(bilateral_bonus, 3),
+
+class FaceTrack:
+    _id_counter: int = 0
+
+    def __init__(self, bbox: Tuple[int, int, int, int], ts: float) -> None:
+        FaceTrack._id_counter += 1
+        self.face_id = FaceTrack._id_counter
+        self.kalman = LandmarkKalman()
+        self.bbox = bbox
+        self.last_seen = ts
+
+
+class FaceRoiExtractor:
+    """MediaPipe FaceMesh — forehead + cheek ROIs for r-PPG."""
+
+    def __init__(self, max_faces: int = MAX_NUM_FACES) -> None:
+        self.available = MEDIAPIPE_OK
+        if not MEDIAPIPE_OK:
+            return
+        self.max_faces = max_faces
+        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=max_faces,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
         )
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # HELPERS  (private)
-    # ──────────────────────────────────────────────────────────────────────────
+        self.roi_groups = [FOREHEAD_LANDMARKS, LEFT_CHEEK_LANDMARKS, RIGHT_CHEEK_LANDMARKS]
+        self._tracks: Dict[int, FaceTrack] = {}
 
     @staticmethod
-    def _level_label(score: float) -> str:
-        """Map 0–10 score to clinical pain level label."""
-        if score < 2.0:  return "none"
-        if score < 4.0:  return "mild"
-        if score < 6.0:  return "moderate"
-        if score < 8.0:  return "severe"
-        return "extreme"
+    def _landmarks_to_bbox(lms: List[Tuple[float, float]]) -> Tuple[int, int, int, int]:
+        xs = [p[0] for p in lms]
+        ys = [p[1] for p in lms]
+        return (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
 
+    @staticmethod
+    def _iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        area_a = max((ax2 - ax1) * (ay2 - ay1), 1)
+        area_b = max((bx2 - bx1) * (by2 - by1), 1)
+        return inter / (area_a + area_b - inter)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FASTAPI INTEGRATION HELPER
-# ══════════════════════════════════════════════════════════════════════════════
+    def _match_and_update_tracks(
+        self, bboxes: List[Tuple[int, int, int, int]], now: float
+    ) -> List[int]:
+        track_ids = list(self._tracks.keys())
+        assigned = [-1] * len(bboxes)
+        if track_ids:
+            n_det, n_trk = len(bboxes), len(track_ids)
+            iou_mat = np.zeros((n_det, n_trk), dtype=np.float32)
+            for r, bb in enumerate(bboxes):
+                for c, tid in enumerate(track_ids):
+                    iou_mat[r, c] = self._iou(bb, self._tracks[tid].bbox)
+            while True:
+                r, c = np.unravel_index(np.argmax(iou_mat), iou_mat.shape)
+                if iou_mat[r, c] < FACE_MATCH_IOU_MIN:
+                    break
+                tid = track_ids[c]
+                assigned[r] = tid
+                self._tracks[tid].bbox = bboxes[r]
+                self._tracks[tid].last_seen = now
+                iou_mat[r, :] = 0.0
+                iou_mat[:, c] = 0.0
+        for r, fid in enumerate(assigned):
+            if fid == -1:
+                t = FaceTrack(bboxes[r], now)
+                self._tracks[t.face_id] = t
+                assigned[r] = t.face_id
+        return assigned
 
-class MultiPatientScorerPool:
-    """
-    Thread-safe pool of FaceMeshPainScorer instances keyed by session_id.
+    def _prune_stale_tracks(self, now: float) -> None:
+        expired = [fid for fid, t in self._tracks.items() if now - t.last_seen > FACE_TRACK_TIMEOUT]
+        for fid in expired:
+            del self._tracks[fid]
 
-    Use this in your FastAPI endpoint when processing video frames:
+    def extract(self, frame: np.ndarray) -> List[FaceRoiResult]:
+        if not self.available:
+            return []
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = self.face_mesh.process(rgb)
+        now = time.time()
+        if not result.multi_face_landmarks:
+            self._prune_stale_tracks(now)
+            return []
 
-        pool = MultiPatientScorerPool()
+        all_raw_lms = [
+            [(lm.x * w, lm.y * h) for lm in face.landmark]
+            for face in result.multi_face_landmarks
+        ]
+        all_bboxes = [self._landmarks_to_bbox(lms) for lms in all_raw_lms]
+        face_ids = self._match_and_update_tracks(all_bboxes, now)
+        self._prune_stale_tracks(now)
 
-        @app.post("/triage/vision")
-        async def vision_endpoint(session_id: str, frame: ...) -> dict:
-            scorer = pool.get_or_create(session_id)
-            result = scorer.score(landmarks)
-            return result.to_api_dict()
-
-        @app.delete("/triage/session/{session_id}")
-        async def end_session(session_id: str):
-            pool.remove(session_id)
-    """
-
-    def __init__(self, config: Optional[PainScoringConfig] = None):
-        self._cfg = config or PainScoringConfig()
-        self._scorers: dict[str, FaceMeshPainScorer] = {}
-
-    def get_or_create(self, session_id: str) -> FaceMeshPainScorer:
-        if session_id not in self._scorers:
-            self._scorers[session_id] = FaceMeshPainScorer(self._cfg)
-        return self._scorers[session_id]
-
-    def remove(self, session_id: str):
-        self._scorers.pop(session_id, None)
-
-    def __len__(self):
-        return len(self._scorers)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# QUICK DEMO  (run this file directly to verify the scorer)
-# ══════════════════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    print("FaceMeshPainScorer — synthetic smoke test")
-    print("=" * 50)
-
-    import mediapipe as mp # type: ignore
-    import cv2 # type: ignore
-
-
-    mp_face_mesh = mp.solutions.face_mesh.FaceMesh
-    face_mesh    = mp_face_mesh.FaceMesh(
-        static_image_mode=False, max_num_faces=1,
-        refine_landmarks=True, min_detection_confidence=0.5,
-    )
-
-    scorer = FaceMeshPainScorer()
-    cap    = cv2.VideoCapture(0)
-
-    if not cap.isOpened():
-        print("No camera found — run from a machine with a webcam.")
-    else:
-        print("Press Q to quit. Calibrating for first ~1.5s (look neutral)...")
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-
-            rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = face_mesh.process(rgb)
-
-            if results.multi_face_landmarks:
-                lm  = results.multi_face_landmarks[0].landmark
-                res = scorer.score(lm)
-
-                status = (
-                    f"Calibrating {res.calibration_progress*100:.0f}%"
-                    if not res.is_calibrated
-                    else f"Pain: {res.pain_score:4.1f}/10  [{res.pain_level}]  "
-                         f"AU4={res.au_scores.au4_brow_lowering:.2f}  "
-                         f"AU43={res.au_scores.au43_eye_closure:.2f}  "
-                         f"AU9={res.au_scores.au9_nose_wrinkle:.2f}"
+        output: List[FaceRoiResult] = []
+        for det_idx, face_id in enumerate(face_ids):
+            track = self._tracks[face_id]
+            smooth_lms = track.kalman.update(all_raw_lms[det_idx])
+            masks, rects = [], []
+            for group in self.roi_groups:
+                pts = np.array(
+                    [(int(smooth_lms[i][0]), int(smooth_lms[i][1])) for i in group],
+                    dtype=np.int32,
                 )
-                print(f"\r{status}", end="", flush=True)
-                cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6, (0, 200, 0) if res.pain_score < 5 else (0, 0, 255), 2)
+                if len(pts) < 3:
+                    continue
+                hull = cv2.convexHull(pts)
+                bx, by, bw, bh = cv2.boundingRect(hull)
+                local_mask = np.zeros((bh, bw), dtype=np.uint8)
+                local_hull = hull - np.array([bx, by], dtype=np.int32)
+                cv2.fillConvexPoly(local_mask, local_hull, 255)
+                local_mask = cv2.erode(local_mask, _ERODE_KERNEL, iterations=1)
+                x1, y1 = max(0, bx), max(0, by)
+                x2, y2 = min(w, bx + bw), min(h, by + bh)
+                masks.append(local_mask)
+                rects.append((x1, y1, x2, y2))
+            output.append(FaceRoiResult(face_id=face_id, masks=masks, rects=rects, bbox=all_bboxes[det_idx]))
+        return output
 
-            cv2.imshow("Pain Scorer Test", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
 
-        print(f"\nSession peak: {scorer.get_session_peak():.1f}  "
-              f"mean: {scorer.get_session_mean():.1f}")
-        cap.release()
-        cv2.destroyAllWindows()
+class RppgProcessor:
+    """Remote photoplethysmography — CHROM/POS pipeline + ML SpO₂ estimate."""
+
+    def __init__(self, fps: float = RPPG_ASSUMED_FPS) -> None:
+        self.fps = fps
+        self._buf_len = RPPG_BUFFER_FRAMES
+        self._r_buf = np.zeros(self._buf_len, dtype=np.float64)
+        self._g_buf = np.zeros(self._buf_len, dtype=np.float64)
+        self._b_buf = np.zeros(self._buf_len, dtype=np.float64)
+        self._buf_count = 0
+        self._buf_head = 0
+        self.spo2 = 0.0
+        self.heart_rate = 0.0
+        self.spo2_smooth = 0.0
+        self.signal_quality = 0.0
+        self._bpf_cache: Dict = {}
+        self._model = None
+        self._model_ready = False
+
+    def _init_ml_model(self) -> None:
+        if not SKLEARN_OK:
+            return
+        np.random.seed(42)
+        n = 2000
+        spo2_gt = np.random.uniform(88.0, 100.0, n)
+        ratio_rg = (-0.8 * spo2_gt + 104.0) / 100.0 + np.random.normal(0, 0.05, n)
+        ratio_rb = ratio_rg * 0.85 + np.random.normal(0, 0.04, n)
+        X = np.column_stack([
+            ratio_rg, ratio_rb,
+            np.random.uniform(0.8, 2.5, n),
+            np.random.uniform(0.2, 0.9, n),
+            np.random.uniform(0.3, 1.0, n),
+            np.random.uniform(0.01, 0.15, n),
+            np.random.uniform(1, 7, n),
+        ])
+        y = np.clip(spo2_gt, 88.0, 100.0)
+        self._model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("gbr", GradientBoostingRegressor(
+                n_estimators=200, max_depth=4, learning_rate=0.05,
+                subsample=0.8, random_state=42,
+            )),
+        ])
+        self._model.fit(X, y)
+        self._model_ready = True
+
+    def push_frame_direct(self, r_mean: float, g_mean: float, b_mean: float) -> None:
+        idx = self._buf_head
+        self._r_buf[idx], self._g_buf[idx], self._b_buf[idx] = r_mean, g_mean, b_mean
+        self._buf_head = (idx + 1) % self._buf_len
+        if self._buf_count < self._buf_len:
+            self._buf_count += 1
+
+    def _buffer_view(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        n = self._buf_count
+        if n == 0:
+            empty = np.empty(0, dtype=np.float64)
+            return empty, empty, empty
+        if n < self._buf_len:
+            return self._r_buf[:n], self._g_buf[:n], self._b_buf[:n]
+        h = self._buf_head
+        return (
+            np.concatenate((self._r_buf[h:], self._r_buf[:h])),
+            np.concatenate((self._g_buf[h:], self._g_buf[:h])),
+            np.concatenate((self._b_buf[h:], self._b_buf[:h])),
+        )
+
+    def process(self, fps: Optional[float] = None) -> bool:
+        if fps is not None:
+            self.fps = fps
+        if self._buf_count < RPPG_MIN_FRAMES:
+            return False
+        R, G, B = self._buffer_view()
+        R_norm = R / (R.mean() + 1e-8)
+        G_norm = G / (G.mean() + 1e-8)
+        B_norm = B / (B.mean() + 1e-8)
+        X_c = 3.0 * R_norm - 2.0 * G_norm
+        Y_c = 1.5 * R_norm + G_norm - 1.5 * B_norm
+        alpha = np.std(X_c) / (np.std(Y_c) + 1e-8)
+        chrom_signal = X_c - alpha * Y_c
+        C = np.column_stack([R_norm, G_norm, B_norm])
+        Cn = C / (C.mean(axis=0) + 1e-8)
+        H = np.array([[0, 1, -1], [-2, 1, 1]], dtype=np.float64)
+        S_pos = (H @ Cn.T).T
+        pos_signal = S_pos[:, 0] - (np.std(S_pos[:, 0]) / (np.std(S_pos[:, 1]) + 1e-8)) * S_pos[:, 1]
+        raw_signal = 0.5 * chrom_signal + 0.5 * pos_signal
+        detrended = detrend(raw_signal)
+        std = detrended.std()
+        if std < 1e-8:
+            return False
+        normalised = (detrended - detrended.mean()) / std
+        nyq = self.fps / 2.0
+        low = float(np.clip(RPPG_BPF_LOW / nyq, 0.001, 0.999))
+        high = float(np.clip(RPPG_BPF_HIGH / nyq, 0.001, 0.999))
+        if low >= high:
+            return False
+        key = (self.fps, low, high)
+        if key not in self._bpf_cache:
+            self._bpf_cache[key] = butter(4, [low, high], btype="band")
+        b_coef, a_coef = self._bpf_cache[key]
+        filtered = filtfilt(b_coef, a_coef, normalised)
+        q1, q3 = np.percentile(filtered, [25, 75])
+        filtered = np.clip(filtered, q1 - 3 * (q3 - q1), q3 + 3 * (q3 - q1))
+        features, freq_hz = self._extract_features(filtered, R, G, B)
+        if features is None:
+            return False
+        if not self._model_ready:
+            self._init_ml_model()
+        if self._model_ready:
+            self.spo2 = float(np.clip(self._model.predict(np.array(features).reshape(1, -1))[0], 70.0, 100.0))
+        else:
+            ratio = (np.std(R) / (R.mean() + 1e-8)) / (np.std(G) / (G.mean() + 1e-8))
+            self.spo2 = float(np.clip(104.0 - 17.0 * ratio, 70.0, 100.0))
+        if self.spo2_smooth == 0.0:
+            self.spo2_smooth = self.spo2
+        else:
+            self.spo2_smooth = SPO2_SMOOTH_ALPHA * self.spo2 + (1 - SPO2_SMOOTH_ALPHA) * self.spo2_smooth
+        if freq_hz > 0:
+            self.heart_rate = freq_hz * 60.0
+        return True
+
+    def _extract_features(
+        self, filtered: np.ndarray, R: np.ndarray, G: np.ndarray, B: np.ndarray
+    ) -> Tuple[Optional[List[float]], float]:
+        n = len(filtered)
+        if n < 32:
+            return None, 0.0
+        from scipy.stats import skew, kurtosis
+        ac_r = float(R.std() / (np.mean(np.abs(R)) + 1e-8))
+        ac_g = float(G.std() / (np.mean(np.abs(G)) + 1e-8))
+        ac_b = float(B.std() / (np.mean(np.abs(B)) + 1e-8))
+        ratio_rg, ratio_rb = ac_r / (ac_g + 1e-8), ac_r / (ac_b + 1e-8)
+        nperseg = min(256, n // 2)
+        freqs, psd = scipy_signal.welch(filtered, fs=self.fps, nperseg=nperseg)
+        mask = (freqs >= RPPG_BPF_LOW) & (freqs <= RPPG_BPF_HIGH)
+        if mask.sum() == 0:
+            return None, 0.0
+        psd_band, freqs_band = psd[mask], freqs[mask]
+        dom_idx = int(np.argmax(psd_band))
+        dom_freq = float(freqs_band[dom_idx])
+        psd_norm = psd_band / (psd_band.sum() + 1e-8)
+        spec_ent = float(-np.sum(psd_norm * np.log(psd_norm + 1e-8)))
+        snr_proxy = float(psd_band[dom_idx] / (psd_band.mean() + 1e-8))
+        rms_green = float(np.sqrt(np.mean(G ** 2)))
+        skin_tone = float(np.clip(rms_green / 255.0 * 6.0, 1.0, 6.0))
+        self.signal_quality = float(np.clip(snr_proxy / 20.0, 0.0, 1.0))
+        return [ratio_rg, ratio_rb, dom_freq, spec_ent, snr_proxy, rms_green, skin_tone], dom_freq
+
+
+def classify_posture(
+    kp_xy: Optional[np.ndarray],
+    kp_conf: Optional[np.ndarray],
+    bbox: Tuple[int, int, int, int],
+) -> str:
+    x1, y1, x2, y2 = bbox
+    bh, bw = max(y2 - y1, 1), max(x2 - x1, 1)
+    KP_REQUIRED = (5, 6, 11, 12)
+    kp_valid = (
+        kp_xy is not None and kp_conf is not None
+        and len(kp_conf) > max(KP_REQUIRED)
+        and all(float(kp_conf[k]) >= KP_MIN_CONF for k in KP_REQUIRED)
+    )
+    if kp_valid:
+        sh_x = (float(kp_xy[5][0]) + float(kp_xy[6][0])) / 2
+        sh_y = (float(kp_xy[5][1]) + float(kp_xy[6][1])) / 2
+        hp_x = (float(kp_xy[11][0]) + float(kp_xy[12][0])) / 2
+        hp_y = (float(kp_xy[11][1]) + float(kp_xy[12][1])) / 2
+        trunk_angle = math.degrees(math.atan2(abs(hp_x - sh_x), abs(hp_y - sh_y) + 1e-6))
+        if trunk_angle > FALLEN_TRUNK_DEG:
+            return Posture.FALLEN
+        if trunk_angle < UPRIGHT_TRUNK_DEG:
+            return Posture.STANDING if (bh / bw) > STANDING_BBOX_RATIO else Posture.SITTING
+        return Posture.FALLEN if (bw / bh) > FALLEN_BBOX_RATIO else Posture.SITTING
+    if (bw / bh) > FALLEN_BBOX_RATIO:
+        return Posture.FALLEN
+    return Posture.STANDING if (bh / bw) > STANDING_BBOX_RATIO else Posture.SITTING
+
+
+@dataclass
+class VisionResult:
+    spo2: float = 0.0
+    heart_rate: float = 0.0
+    signal_quality: float = 0.0
+    posture_status: str = Posture.UNKNOWN
+    posture_confidence: float = 0.0
+    fall_detected: bool = False
+    immobile_seconds: float = 0.0
+    faces_detected: int = 0
+
+
+# Module-level singletons for streaming sessions (keyed by patient_id in production)
+_processors: Dict[str, RppgProcessor] = {}
+_fall_detectors: Dict[str, "FallDetector"] = {}
+
+
+class FallDetector:
+    """Single-frame YOLO pose inference for fall detection."""
+
+    def __init__(self) -> None:
+        self.available = YOLO_OK
+        self._model = YOLO(YOLO_MODEL) if YOLO_OK else None
+        self._fallen_since: Optional[float] = None
+        self._last_move_time: float = time.time()
+
+    def analyze(self, frame: np.ndarray) -> Tuple[str, float, bool, float]:
+        if not self.available or self._model is None:
+            return Posture.UNKNOWN, 0.0, False, 0.0
+        results = self._model(frame, conf=0.45, verbose=False)
+        now = time.time()
+        best_posture = Posture.UNKNOWN
+        confidence = 0.0
+        for r in results:
+            if r.keypoints is None or r.boxes is None:
+                continue
+            for i in range(len(r.boxes)):
+                box = r.boxes.xyxy[i].cpu().numpy().astype(int)
+                bbox = (int(box[0]), int(box[1]), int(box[2]), int(box[3]))
+                kp = r.keypoints.xy[i].cpu().numpy()
+                kp_conf = r.keypoints.conf[i].cpu().numpy() if r.keypoints.conf is not None else None
+                posture = classify_posture(kp, kp_conf, bbox)
+                conf = float(r.boxes.conf[i]) if r.boxes.conf is not None else 0.5
+                if conf > confidence:
+                    confidence, best_posture = conf, posture
+        fall_detected = best_posture == Posture.FALLEN
+        if fall_detected:
+            if self._fallen_since is None:
+                self._fallen_since = now
+            immobile = now - self._last_move_time if best_posture == Posture.FALLEN else 0.0
+        else:
+            self._fallen_since = None
+            self._last_move_time = now
+            immobile = 0.0
+        if self._fallen_since and fall_detected:
+            immobile = now - self._fallen_since
+        return best_posture, confidence, fall_detected, immobile
+
+
+class VisionAnalyzer:
+    """High-level API: decode image → vitals + posture."""
+
+    def __init__(self) -> None:
+        self.face_extractor = FaceRoiExtractor()
+
+    @staticmethod
+    def decode_base64(image_base64: str) -> np.ndarray:
+        raw = base64.b64decode(image_base64)
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("Could not decode image — ensure valid base64 JPEG/PNG")
+        return frame
+
+    def analyze_frame(self, frame: np.ndarray, patient_id: str = "default") -> VisionResult:
+        result = VisionResult()
+        if patient_id not in _processors:
+            _processors[patient_id] = RppgProcessor()
+        if patient_id not in _fall_detectors:
+            _fall_detectors[patient_id] = FallDetector()
+
+        processor = _processors[patient_id]
+        fall_detector = _fall_detectors[patient_id]
+
+        faces = self.face_extractor.extract(frame)
+        result.faces_detected = len(faces)
+        for face in faces:
+            rgb = face.mean_rgb(frame)
+            if rgb:
+                processor.push_frame_direct(*rgb)
+
+        if processor.process():
+            result.spo2 = round(processor.spo2_smooth or processor.spo2, 1)
+            result.heart_rate = round(processor.heart_rate, 1)
+            result.signal_quality = round(processor.signal_quality, 2)
+
+        posture, conf, fall, immobile = fall_detector.analyze(frame)
+        result.posture_status = posture
+        result.posture_confidence = round(conf, 2)
+        result.fall_detected = fall
+        result.immobile_seconds = round(immobile, 1)
+        return result
+
+    def analyze_base64(self, image_base64: str, patient_id: str = "default") -> VisionResult:
+        return self.analyze_frame(self.decode_base64(image_base64), patient_id)

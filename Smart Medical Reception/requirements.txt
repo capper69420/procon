@@ -1,0 +1,12 @@
+ultralytics
+mediapipe==0.10.14
+opencv-python
+numpy
+scipy
+scikit-learn
+requests
+fastapi
+uvicorn[standard]
+python-multipart
+supabase
+pydantic
