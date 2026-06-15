@@ -1,0 +1,388 @@
+# Build Complete Real-Time Speech-to-Text Application
+
+You are a senior Python, FastAPI, React, WebRTC, and AI engineer.
+
+Build a COMPLETE production-ready project called:
+
+**LiveTranscribe**
+
+A real-time speech-to-text application using Faster-Whisper.
+
+## Main Goal
+
+Create a desktop/web application that transcribes speech in real time.
+
+Requirements:
+
+* Speech → Text only
+* No translation
+* Only English and Japanese
+* Real-time transcription
+* Low latency
+* Local inference
+* Faster-Whisper backend
+* Single modern frontend
+* Works on Windows
+* GPU acceleration when available
+* CPU fallback
+
+---
+
+# Tech Stack
+
+Frontend:
+
+* React
+* TypeScript
+* Vite
+* TailwindCSS
+* WebSocket client
+
+Backend:
+
+* FastAPI
+* Python 3.11+
+* Faster-Whisper
+* Silero VAD
+* WebSocket streaming
+
+AI:
+
+* Faster Whisper
+* distil-large-v3 (default)
+* configurable models
+
+---
+
+# Architecture
+
+Create the following structure:
+
+project/
+
+frontend/
+src/
+components/
+hooks/
+pages/
+services/
+
+backend/
+app/
+routes/
+services/
+models/
+core/
+
+requirements.txt
+README.md
+docker-compose.yml
+
+---
+
+# User Interface
+
+Single-page application.
+
+Layout:
+
+---
+
+## | LiveTranscribe |
+
+Microphone Selection
+
+Language:
+( Auto )
+( English )
+( Japanese )
+
+Model:
+( distil-large-v3 )
+( small )
+( base )
+
+[ Start ]
+
+[ Stop ]
+
+---
+
+Live Transcript
+
+---
+
+Hello everyone
+
+今日は良い天気ですね
+
+This project uses Faster Whisper
+
+---
+
+Statistics
+
+Current Language
+Latency
+Words Per Minute
+Recording Time
+
+---
+
+---
+
+# Features
+
+## Real-Time Microphone Capture
+
+Capture microphone audio from browser.
+
+Use:
+
+MediaRecorder
+Web Audio API
+
+Send chunks to backend every:
+
+250 ms
+
+through WebSocket.
+
+---
+
+## Voice Activity Detection
+
+Use Silero VAD.
+
+Ignore:
+
+* silence
+* keyboard noise
+* background hum
+
+Only process speech.
+
+---
+
+## Language Handling
+
+Support only:
+
+English
+Japanese
+
+Language Modes:
+
+AUTO
+ENGLISH
+JAPANESE
+
+AUTO:
+detect language automatically
+
+If language != en and != ja
+
+discard transcript.
+
+No translation allowed.
+
+---
+
+## Faster Whisper Configuration
+
+GPU:
+
+device="cuda"
+compute_type="float16"
+
+CPU:
+
+device="cpu"
+compute_type="int8"
+
+Model configurable.
+
+Default:
+
+distil-large-v3
+
+---
+
+## Streaming Pipeline
+
+Audio Chunk
+↓
+VAD
+↓
+Buffer
+↓
+Faster Whisper
+↓
+Partial Transcript
+↓
+Frontend
+
+Return partial results immediately.
+
+Do not wait for entire sentences.
+
+---
+
+## WebSocket API
+
+/ws/transcribe
+
+Events:
+
+start
+stop
+partial_transcript
+final_transcript
+error
+stats
+
+JSON format.
+
+---
+
+## Frontend Requirements
+
+Display transcript instantly.
+
+Auto-scroll.
+
+Dark mode support.
+
+Responsive layout.
+
+Show:
+
+Current Language
+Model
+Latency
+Connection Status
+
+---
+
+## Performance Requirements
+
+Target latency:
+
+< 1 second
+
+Audio chunk:
+
+250ms
+
+VAD enabled
+
+Memory efficient
+
+Non-blocking
+
+Use async everywhere possible.
+
+---
+
+## Error Handling
+
+Microphone unavailable
+
+GPU unavailable
+
+WebSocket disconnect
+
+Invalid audio chunks
+
+Model loading failure
+
+Graceful recovery.
+
+---
+
+## Logging
+
+Backend:
+
+logs/app.log
+
+Log:
+
+connections
+transcription speed
+errors
+language detection
+
+---
+
+## Settings Panel
+
+Allow user to configure:
+
+Model
+Chunk size
+VAD sensitivity
+Language mode
+
+Persist settings in local storage.
+
+---
+
+## README
+
+Generate complete README including:
+
+Installation
+
+Python setup
+
+Frontend setup
+
+GPU setup
+
+CUDA setup
+
+Running backend
+
+Running frontend
+
+Production deployment
+
+Troubleshooting
+
+---
+
+## Docker Support
+
+Create:
+
+Dockerfile backend
+
+Dockerfile frontend
+
+docker-compose.yml
+
+One command:
+
+docker-compose up
+
+starts everything.
+
+---
+
+## Code Quality
+
+Requirements:
+
+* Type hints
+* Modular architecture
+* Clean code
+* Comments where necessary
+* Production-ready
+* No placeholder code
+* No TODOs
+* Fully runnable
+
+Generate every file completely.
+
+Output files one by one with filenames and full contents.
