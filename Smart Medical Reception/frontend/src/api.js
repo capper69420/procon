@@ -1,4 +1,4 @@
-  const API_BASE = import.meta.env.VITE_API_URL || '';
+﻿  const API_BASE = import.meta.env.VITE_API_URL || '';
 
   async function request(path, options = {}) {
     const url = `${API_BASE}${path}`;
@@ -46,6 +46,20 @@
     });
   }
 
+  export async function transcribeAudio(audioFile, patientId) {
+    const formData = new FormData();
+    formData.append('audio_file', audioFile);
+    if (patientId) formData.append('patient_id', patientId);
+
+    const res = await fetch(`${API_BASE}/api/audio/transcribe`, {
+      method: 'POST',
+      body: formData,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
+    return data;
+  }
+
   export async function postTriage(patientId, payload = {}) {
     return request('/api/triage', {
       method: 'POST',
@@ -61,3 +75,4 @@
       return false;
     }
   }
+

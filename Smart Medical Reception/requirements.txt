@@ -10,3 +10,4 @@ uvicorn[standard]
 python-multipart
 supabase
 pydantic
+faster-whisper>=1.1.0

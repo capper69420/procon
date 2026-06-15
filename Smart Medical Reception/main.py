@@ -1,5 +1,5 @@
-"""
-main.py — FastAPI backend for the Health Monitor hackathon stack.
+﻿"""
+main.py â€” FastAPI backend for the Health Monitor hackathon stack.
 
 Endpoints:
   GET  /health
@@ -13,17 +13,20 @@ Run:  uvicorn main:app --reload --port 8000
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from facemesh import VisionAnalyzer
 from fusion_engine import FusionEngine
+from speech_transcriber import Transcriber
 
-# ── Optional Supabase persistence ─────────────────────────────────────────────
+# â”€â”€ Optional Supabase persistence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
@@ -40,7 +43,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ── Pydantic models ───────────────────────────────────────────────────────────
+# â”€â”€ Pydantic models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class VisionRequest(BaseModel):
     patient_id: str
     image_base64: str
@@ -88,6 +91,21 @@ class AudioResponse(BaseModel):
     stored_at: str
 
 
+class TranscriptSegmentOut(BaseModel):
+    start: float
+    end: float
+    text: str
+    language: str
+
+
+class TranscriptionResponse(BaseModel):
+    patient_id: Optional[str] = None
+    language: Optional[str]
+    transcript: str
+    segments: List[TranscriptSegmentOut]
+    processed_at: str
+
+
 class TriageRequest(BaseModel):
     patient_id: str
     vision: Optional[Dict[str, Any]] = None
@@ -104,7 +122,7 @@ class TriageResponse(BaseModel):
     decided_at: str
 
 
-# ── App setup ─────────────────────────────────────────────────────────────────
+# â”€â”€ App setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app = FastAPI(
     title="Health Monitor API",
     description="Multimodal vision + audio triage for hackathon demo",
@@ -122,8 +140,32 @@ app.add_middleware(
 vision_analyzer = VisionAnalyzer()
 fusion_engine = FusionEngine()
 
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "auto")
+WHISPER_LANGUAGES = {
+    lang.strip().lower()
+    for lang in os.getenv("WHISPER_LANGUAGES", "ja,en").split(",")
+    if lang.strip()
+}
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
+_speech_transcriber: Optional[Transcriber] = None
 
-# ── Supabase helpers ──────────────────────────────────────────────────────────
+
+def _get_speech_transcriber() -> Transcriber:
+    global _speech_transcriber
+    if _speech_transcriber is None:
+        _speech_transcriber = Transcriber(
+            model_name=WHISPER_MODEL,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE_TYPE,
+            language_whitelist=WHISPER_LANGUAGES,
+            beam_size=WHISPER_BEAM_SIZE,
+        )
+    return _speech_transcriber
+
+
+# â”€â”€ Supabase helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def _store_vitals(patient_id: str, result, processed_at: str) -> None:
     if not _supabase:
         return
@@ -242,7 +284,7 @@ def _fetch_patient_context(patient_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# â”€â”€ Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.get("/health")
 def health_check():
     return {
@@ -254,7 +296,7 @@ def health_check():
 
 @app.post("/api/vision", response_model=VisionResponse)
 def process_vision(req: VisionRequest):
-    """Analyze a camera frame — FaceMesh r-PPG vitals + YOLO fall detection."""
+    """Analyze a camera frame â€” FaceMesh r-PPG vitals + YOLO fall detection."""
     try:
         result = vision_analyzer.analyze_base64(req.image_base64, req.patient_id)
     except ValueError as exc:
@@ -295,6 +337,45 @@ def process_audio(req: AudioRequest):
     )
 
 
+@app.post("/api/audio/transcribe", response_model=TranscriptionResponse)
+async def transcribe_audio(
+    audio_file: UploadFile = File(...),
+    patient_id: Optional[str] = Form(default=None),
+):
+    """Transcribe an uploaded audio file with local faster-whisper."""
+    suffix = Path(audio_file.filename or "audio.wav").suffix or ".wav"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = Path(tmp.name)
+            tmp.write(await audio_file.read())
+
+        transcriber = _get_speech_transcriber()
+        segments, language = transcriber.transcribe_file(str(tmp_path))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Audio transcription failed: {exc}") from exc
+    finally:
+        if tmp_path:
+            tmp_path.unlink(missing_ok=True)
+
+    processed_at = _now_iso()
+    transcript = " ".join(segment.text for segment in segments).strip()
+    return TranscriptionResponse(
+        patient_id=patient_id,
+        language=language,
+        transcript=transcript,
+        segments=[
+            TranscriptSegmentOut(
+                start=segment.start,
+                end=segment.end,
+                text=segment.text,
+                language=segment.language,
+            )
+            for segment in segments
+        ],
+        processed_at=processed_at,
+    )
+
 @app.post("/api/triage", response_model=TriageResponse)
 def process_triage(req: TriageRequest):
     """Fuse vision + audio signals and assign triage level A / B / C."""
@@ -323,3 +404,4 @@ def process_triage(req: TriageRequest):
         recommended_action=triage.recommended_action,
         decided_at=triage.decided_at,
     )
+
