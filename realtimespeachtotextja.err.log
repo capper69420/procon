@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "C:\Users\tsah-05\OneDrive\Desktop\health_monitor\realtimespeachtotextja.py", line 60, in <module>
+    transcriber()
+  File "C:\Users\tsah-05\OneDrive\Desktop\health_monitor\realtimespeachtotextja.py", line 57, in transcriber
+    print(segment.text, flush=True)
+  File "C:\Users\tsah-05\AppData\Local\Programs\Python\Python311\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 0-15: character maps to <undefined>
