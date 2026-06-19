@@ -17,20 +17,52 @@ Run:
 from __future__ import annotations
 
 import argparse
+import csv
+import os
 import queue
 import sys
 import threading
 import time
 import warnings
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from scipy import signal as scipy_signal
-from scipy.signal import butter, detrend, filtfilt
-from scipy.stats import kurtosis, skew
+
+try:
+    from scipy import signal as scipy_signal
+    from scipy.signal import butter, detrend, filtfilt
+    from scipy.stats import kurtosis, skew
+    SCIPY_OK = True
+except ImportError:
+    scipy_signal = None
+    butter = None
+    detrend = None
+    filtfilt = None
+    SCIPY_OK = False
+    print("[WARNING] scipy not found. Using numpy-only signal preprocessing fallback.")
+
+    def skew(values: np.ndarray) -> float:
+        x = np.asarray(values, dtype=np.float64)
+        if x.size == 0:
+            return 0.0
+        centered = x - float(np.mean(x))
+        std = float(np.std(centered))
+        if std < 1e-8:
+            return 0.0
+        return float(np.mean((centered / std) ** 3))
+
+    def kurtosis(values: np.ndarray) -> float:
+        x = np.asarray(values, dtype=np.float64)
+        if x.size == 0:
+            return 0.0
+        centered = x - float(np.mean(x))
+        std = float(np.std(centered))
+        if std < 1e-8:
+            return 0.0
+        return float(np.mean((centered / std) ** 4) - 3.0)
 
 warnings.filterwarnings("ignore")
 
@@ -74,6 +106,12 @@ RPPG_MIN_FRAMES = 90
 RPPG_ASSUMED_FPS = 30.0
 SPO2_UPDATE_INTERVAL = 15
 SPO2_SMOOTH_ALPHA = 0.15
+
+# STEP 5 preprocessing settings.
+PREPROCESS_WINDOW_SECONDS = 10.0
+PREPROCESS_STEP_SECONDS = 10.0
+PREPROCESS_SMOOTH_SECONDS = 0.15
+PREPROCESS_MIN_SAMPLES = 16
 
 # FaceMesh ROI landmarks
 FOREHEAD_LANDMARKS = [10, 67, 69, 104, 108, 151, 337, 338, 297, 299]
@@ -161,6 +199,365 @@ class LandmarkKalman:
         return out
 
 
+
+# ---------------- STEP 5: signal preprocessing / noise reduction starts ----------------
+
+@dataclass
+class PreprocessedRgbWindow:
+    timestamps: np.ndarray
+    cleaned_r_signal: np.ndarray
+    cleaned_g_signal: np.ndarray
+    cleaned_b_signal: np.ndarray
+    cleaned_rppg_signal: np.ndarray
+    sample_rate: float
+
+
+def _safe_float_array(values: List[float] | np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return arr
+    finite = np.isfinite(arr)
+    if finite.all():
+        return arr
+    fill = float(np.mean(arr[finite])) if finite.any() else 0.0
+    return np.where(finite, arr, fill).astype(np.float64)
+
+
+def estimate_sample_rate(timestamps: List[float] | np.ndarray, fallback_fps: float = RPPG_ASSUMED_FPS) -> float:
+    ts = _safe_float_array(timestamps)
+    if ts.size >= 2:
+        diffs = np.diff(ts)
+        diffs = diffs[np.isfinite(diffs) & (diffs > 1e-6)]
+        if diffs.size:
+            # Median interval is robust to occasional delayed frames or duplicate reads.
+            return float(np.clip(1.0 / np.median(diffs), 1.0, 120.0))
+    return float(fallback_fps if fallback_fps > 0 else RPPG_ASSUMED_FPS)
+
+
+def moving_average_signal(values: List[float] | np.ndarray, window_samples: int) -> np.ndarray:
+    x = _safe_float_array(values)
+    if x.size == 0:
+        return x
+    window_samples = int(max(1, min(window_samples, x.size)))
+    if window_samples <= 1:
+        return x.copy()
+    kernel = np.ones(window_samples, dtype=np.float64) / float(window_samples)
+    return np.convolve(x, kernel, mode="same")
+
+
+def detrend_signal(values: List[float] | np.ndarray) -> np.ndarray:
+    x = _safe_float_array(values)
+    if x.size == 0:
+        return x
+    centered = x - float(np.mean(x))
+    if centered.size < 3:
+        return centered
+    if SCIPY_OK and detrend is not None:
+        return np.asarray(detrend(centered, type="linear"), dtype=np.float64)
+
+    # NumPy fallback: remove a slow moving baseline to reduce lighting drift.
+    baseline_window = max(3, int(round(centered.size * 0.2)))
+    baseline = moving_average_signal(centered, baseline_window)
+    return centered - baseline
+
+
+def normalize_signal(values: List[float] | np.ndarray) -> np.ndarray:
+    x = _safe_float_array(values)
+    if x.size == 0:
+        return x
+    centered = x - float(np.mean(x))
+    std = float(np.std(centered))
+    if std < 1e-8:
+        return np.zeros_like(centered)
+    return centered / std
+
+
+def _fft_bandpass_fallback(values: np.ndarray, sample_rate: float, low_hz: float, high_hz: float) -> np.ndarray:
+    x = _safe_float_array(values)
+    if x.size < 4 or sample_rate <= 0:
+        return normalize_signal(x)
+    freqs = np.fft.rfftfreq(x.size, d=1.0 / sample_rate)
+    spectrum = np.fft.rfft(x)
+    keep = (freqs >= low_hz) & (freqs <= high_hz)
+    if not np.any(keep):
+        return normalize_signal(x)
+    spectrum[~keep] = 0.0
+    return np.fft.irfft(spectrum, n=x.size).astype(np.float64)
+
+
+def bandpass_filter_signal(
+    values: List[float] | np.ndarray,
+    sample_rate: float,
+    low_hz: float = RPPG_BPF_LOW,
+    high_hz: float = RPPG_BPF_HIGH,
+    order: int = 4,
+) -> np.ndarray:
+    x = _safe_float_array(values)
+    if x.size == 0:
+        return x
+    if x.size < PREPROCESS_MIN_SAMPLES or sample_rate <= 0:
+        return normalize_signal(x)
+
+    nyquist = sample_rate / 2.0
+    # 0.7-4.0 Hz covers roughly 42-240 bpm, a practical webcam rPPG band.
+    low = max(0.01, min(low_hz, nyquist * 0.90))
+    high = max(low + 0.01, min(high_hz, nyquist * 0.95))
+    if low >= high or high >= nyquist:
+        return normalize_signal(x)
+
+    if SCIPY_OK and butter is not None and filtfilt is not None:
+        b_coef, a_coef = butter(order, [low / nyquist, high / nyquist], btype="band")
+        padlen = 3 * max(len(a_coef), len(b_coef))
+        if x.size > padlen:
+            return np.asarray(filtfilt(b_coef, a_coef, x), dtype=np.float64)
+
+    return _fft_bandpass_fallback(x, sample_rate, low, high)
+
+
+def power_spectrum_signal(values: List[float] | np.ndarray, sample_rate: float) -> Tuple[np.ndarray, np.ndarray]:
+    x = _safe_float_array(values)
+    if x.size == 0 or sample_rate <= 0:
+        empty = np.empty(0, dtype=np.float64)
+        return empty, empty
+    if SCIPY_OK and scipy_signal is not None and x.size >= 8:
+        nperseg = min(256, max(8, x.size // 2))
+        return scipy_signal.welch(x, fs=sample_rate, nperseg=nperseg)
+
+    freqs = np.fft.rfftfreq(x.size, d=1.0 / sample_rate)
+    spectrum = np.abs(np.fft.rfft(x)) ** 2 / max(x.size, 1)
+    return freqs.astype(np.float64), spectrum.astype(np.float64)
+
+
+def _prepare_rgb_window(
+    r_values: List[float] | np.ndarray,
+    g_values: List[float] | np.ndarray,
+    b_values: List[float] | np.ndarray,
+    timestamps: Optional[List[float] | np.ndarray],
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    r_arr = np.asarray(r_values, dtype=np.float64).reshape(-1)
+    g_arr = np.asarray(g_values, dtype=np.float64).reshape(-1)
+    b_arr = np.asarray(b_values, dtype=np.float64).reshape(-1)
+    n_items = min(r_arr.size, g_arr.size, b_arr.size)
+    if n_items == 0:
+        return None
+
+    r_arr = r_arr[:n_items]
+    g_arr = g_arr[:n_items]
+    b_arr = b_arr[:n_items]
+    if timestamps is None:
+        ts_arr = np.arange(n_items, dtype=np.float64) / RPPG_ASSUMED_FPS
+    else:
+        ts_arr = np.asarray(timestamps, dtype=np.float64).reshape(-1)[:n_items]
+        if ts_arr.size < n_items:
+            n_items = ts_arr.size
+            r_arr = r_arr[:n_items]
+            g_arr = g_arr[:n_items]
+            b_arr = b_arr[:n_items]
+    if n_items == 0:
+        return None
+
+    valid = np.isfinite(r_arr) & np.isfinite(g_arr) & np.isfinite(b_arr) & np.isfinite(ts_arr)
+    if not np.any(valid):
+        return None
+    return r_arr[valid], g_arr[valid], b_arr[valid], ts_arr[valid]
+
+
+def preprocess_rgb_window(
+    r_values: List[float] | np.ndarray,
+    g_values: List[float] | np.ndarray,
+    b_values: List[float] | np.ndarray,
+    timestamps: Optional[List[float] | np.ndarray] = None,
+    fallback_fps: float = RPPG_ASSUMED_FPS,
+    low_hz: float = RPPG_BPF_LOW,
+    high_hz: float = RPPG_BPF_HIGH,
+    smooth_seconds: float = PREPROCESS_SMOOTH_SECONDS,
+) -> Optional[PreprocessedRgbWindow]:
+    prepared = _prepare_rgb_window(r_values, g_values, b_values, timestamps)
+    if prepared is None:
+        return None
+    r_arr, g_arr, b_arr, ts_arr = prepared
+    if min(r_arr.size, g_arr.size, b_arr.size, ts_arr.size) < PREPROCESS_MIN_SAMPLES:
+        return None
+
+    sample_rate = estimate_sample_rate(ts_arr, fallback_fps=fallback_fps)
+
+    def clean_channel(channel: np.ndarray) -> np.ndarray:
+        no_dc = channel - float(np.mean(channel))
+        detrended = detrend_signal(no_dc)
+        normalised = normalize_signal(detrended)
+        filtered = bandpass_filter_signal(normalised, sample_rate, low_hz=low_hz, high_hz=high_hz)
+        smooth_samples = int(round(max(0.0, smooth_seconds) * sample_rate))
+        if smooth_samples > 1:
+            filtered = moving_average_signal(filtered, smooth_samples)
+        return normalize_signal(filtered)
+
+    cleaned_r = clean_channel(r_arr)
+    cleaned_g = clean_channel(g_arr)
+    cleaned_b = clean_channel(b_arr)
+
+    if min(cleaned_r.size, cleaned_g.size, cleaned_b.size) != ts_arr.size:
+        n_items = min(cleaned_r.size, cleaned_g.size, cleaned_b.size, ts_arr.size)
+        if n_items < PREPROCESS_MIN_SAMPLES:
+            return None
+        cleaned_r = cleaned_r[:n_items]
+        cleaned_g = cleaned_g[:n_items]
+        cleaned_b = cleaned_b[:n_items]
+        ts_arr = ts_arr[:n_items]
+
+    # A simple green-dominant projection is useful as a generic rPPG signal;
+    # SpO2 feature extraction should still use the cleaned per-channel signals.
+    cleaned_rppg = normalize_signal(cleaned_g - 0.5 * (cleaned_r + cleaned_b))
+    return PreprocessedRgbWindow(
+        timestamps=ts_arr,
+        cleaned_r_signal=cleaned_r,
+        cleaned_g_signal=cleaned_g,
+        cleaned_b_signal=cleaned_b,
+        cleaned_rppg_signal=cleaned_rppg,
+        sample_rate=sample_rate,
+    )
+
+
+@dataclass
+class RgbSignalLog:
+    face_id: int
+    r_signal: List[float] = field(default_factory=list)
+    g_signal: List[float] = field(default_factory=list)
+    b_signal: List[float] = field(default_factory=list)
+    timestamps: List[float] = field(default_factory=list)
+    cleaned_r_signal: List[float] = field(default_factory=list)
+    cleaned_g_signal: List[float] = field(default_factory=list)
+    cleaned_b_signal: List[float] = field(default_factory=list)
+    cleaned_rppg_signal: List[float] = field(default_factory=list)
+    cleaned_timestamps: List[float] = field(default_factory=list)
+    _processed_until: int = 0
+
+    def append(self, timestamp: float, r_mean: float, g_mean: float, b_mean: float) -> None:
+        if not all(np.isfinite([timestamp, r_mean, g_mean, b_mean])):
+            return
+        self.timestamps.append(float(timestamp))
+        self.r_signal.append(float(r_mean))
+        self.g_signal.append(float(g_mean))
+        self.b_signal.append(float(b_mean))
+
+    def _append_cleaned_window(self, result: PreprocessedRgbWindow, keep_from: int = 0) -> None:
+        keep_from = max(0, min(int(keep_from), result.timestamps.size))
+        last_ts = self.cleaned_timestamps[-1] if self.cleaned_timestamps else None
+        for idx in range(keep_from, result.timestamps.size):
+            ts_val = float(result.timestamps[idx])
+            if last_ts is not None and ts_val <= last_ts:
+                continue
+            self.cleaned_timestamps.append(ts_val)
+            self.cleaned_r_signal.append(float(result.cleaned_r_signal[idx]))
+            self.cleaned_g_signal.append(float(result.cleaned_g_signal[idx]))
+            self.cleaned_b_signal.append(float(result.cleaned_b_signal[idx]))
+            self.cleaned_rppg_signal.append(float(result.cleaned_rppg_signal[idx]))
+
+    def preprocess_pending_windows(
+        self,
+window_seconds: float = PREPROCESS_WINDOW_SECONDS,
+        step_seconds: float = PREPROCESS_STEP_SECONDS,
+        fallback_fps: float = RPPG_ASSUMED_FPS,
+        smooth_seconds: float = PREPROCESS_SMOOTH_SECONDS,
+        flush: bool = False,
+    ) -> int:
+        n_items = min(len(self.r_signal), len(self.g_signal), len(self.b_signal), len(self.timestamps))
+        if n_items < PREPROCESS_MIN_SAMPLES:
+            return 0
+
+        sample_rate = estimate_sample_rate(self.timestamps[:n_items], fallback_fps=fallback_fps)
+        window_samples = max(PREPROCESS_MIN_SAMPLES, int(round(max(0.1, window_seconds) * sample_rate)))
+        step_samples = max(1, int(round(max(0.1, step_seconds) * sample_rate)))
+
+        processed = 0
+        start = min(self._processed_until, n_items)
+        while start + window_samples <= n_items:
+            end = start + window_samples
+            result = preprocess_rgb_window(
+                self.r_signal[start:end],
+                self.g_signal[start:end],
+                self.b_signal[start:end],
+                self.timestamps[start:end],
+                fallback_fps=sample_rate,
+                smooth_seconds=smooth_seconds,
+            )
+            if result is not None:
+                keep_from = 0 if not self.cleaned_timestamps else max(0, result.timestamps.size - step_samples)
+                self._append_cleaned_window(result, keep_from=keep_from)
+                processed += 1
+            start += step_samples
+            self._processed_until = start
+
+        if flush:
+            start = min(self._processed_until, n_items)
+            if n_items - start >= PREPROCESS_MIN_SAMPLES:
+                result = preprocess_rgb_window(
+                    self.r_signal[start:n_items],
+                    self.g_signal[start:n_items],
+                    self.b_signal[start:n_items],
+                    self.timestamps[start:n_items],
+                    fallback_fps=sample_rate,
+                    smooth_seconds=smooth_seconds,
+                )
+                if result is not None:
+                    self._append_cleaned_window(result, keep_from=0)
+                    processed += 1
+                self._processed_until = n_items
+        return processed
+
+
+def _ensure_csv_parent(path: str) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def save_raw_rgb_csv(path: str, signal_logs: Dict[int, RgbSignalLog]) -> None:
+    if not path:
+        return
+    _ensure_csv_parent(path)
+    rows = 0
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["face_id", "timestamp", "r", "g", "b"])
+        for face_id in sorted(signal_logs):
+            log = signal_logs[face_id]
+            for ts_val, r_val, g_val, b_val in zip(log.timestamps, log.r_signal, log.g_signal, log.b_signal):
+                writer.writerow([face_id, f"{ts_val:.6f}", f"{r_val:.8f}", f"{g_val:.8f}", f"{b_val:.8f}"])
+                rows += 1
+    log_info(f"Saved {rows} raw RGB samples to {path}.")
+
+
+def save_cleaned_rgb_csv(path: str, signal_logs: Dict[int, RgbSignalLog]) -> None:
+    if not path:
+        return
+    _ensure_csv_parent(path)
+    rows = 0
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["face_id", "timestamp", "cleaned_r", "cleaned_g", "cleaned_b", "cleaned_rppg"])
+        for face_id in sorted(signal_logs):
+            log = signal_logs[face_id]
+            for row in zip(
+                log.cleaned_timestamps,
+                log.cleaned_r_signal,
+                log.cleaned_g_signal,
+                log.cleaned_b_signal,
+                log.cleaned_rppg_signal,
+            ):
+                ts_val, r_val, g_val, b_val, rppg_val = row
+                writer.writerow([
+                    face_id,
+                    f"{ts_val:.6f}",
+                    f"{r_val:.8f}",
+                    f"{g_val:.8f}",
+                    f"{b_val:.8f}",
+                    f"{rppg_val:.8f}",
+                ])
+                rows += 1
+    log_info(f"Saved {rows} cleaned RGB samples to {path}.")
+
+# ---------------- STEP 5: signal preprocessing / noise reduction ends ----------------
+
 class RppgProcessor:
     """Ring-buffer r-PPG processor for SpO2 and heart-rate estimation."""
 
@@ -245,6 +642,8 @@ class RppgProcessor:
         )
 
     def _get_bandpass_coefs(self, fps: float) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        if not SCIPY_OK or butter is None:
+            return None
         nyquist = fps / 2.0
         low = float(np.clip(RPPG_BPF_LOW / nyquist, 0.001, 0.999))
         high = float(np.clip(RPPG_BPF_HIGH / nyquist, 0.001, 0.999))
@@ -277,17 +676,14 @@ class RppgProcessor:
         pos_signal = s_pos[:, 0] - (np.std(s_pos[:, 0]) / (np.std(s_pos[:, 1]) + 1e-8)) * s_pos[:, 1]
 
         raw_signal = 0.5 * chrom_signal + 0.5 * pos_signal
-        detrended_signal = detrend(raw_signal)
+        detrended_signal = detrend_signal(raw_signal)
         sig_std = detrended_signal.std()
         if sig_std < 1e-8:
             return False
-        normalised = (detrended_signal - detrended_signal.mean()) / sig_std
-
-        coefs = self._get_bandpass_coefs(self.fps)
-        if coefs is None:
+        normalised = normalize_signal(detrended_signal)
+        filtered = bandpass_filter_signal(normalised, self.fps, RPPG_BPF_LOW, RPPG_BPF_HIGH)
+        if filtered.size < RPPG_MIN_FRAMES:
             return False
-        b_coef, a_coef = coefs
-        filtered = filtfilt(b_coef, a_coef, normalised)
 
         q1, q3 = np.percentile(filtered, [25, 75])
         iqr = q3 - q1
@@ -343,8 +739,7 @@ class RppgProcessor:
         ratio_rg = ac_r / (ac_g + 1e-8)
         ratio_rb = ac_r / (ac_b + 1e-8)
 
-        nperseg = min(256, n_items // 2)
-        freqs, psd = scipy_signal.welch(filtered, fs=self.fps, nperseg=nperseg)
+        freqs, psd = power_spectrum_signal(filtered, self.fps)
         mask = (freqs >= RPPG_BPF_LOW) & (freqs <= RPPG_BPF_HIGH)
         if mask.sum() == 0:
             return None, 0.0
@@ -408,6 +803,7 @@ class FaceRoiResult:
 class SharedFaceResult:
     face_id: int
     rgb: Optional[Tuple[float, float, float]]
+    timestamp: float
     rects_disp: List[Tuple[int, int, int, int]]
     bbox_disp: Tuple[int, int, int, int]
 
@@ -679,6 +1075,7 @@ def _face_worker(
             continue
 
         shared: List[SharedFaceResult] = []
+        sample_ts = time.time()
         for result in raw_results:
             mean_rgb = result.mean_rgb(infer_frame)
             rects_disp = [
@@ -687,7 +1084,7 @@ def _face_worker(
             ]
             bx1, by1, bx2, by2 = result.bbox
             bbox_disp = (int(bx1 * sx), int(by1 * sy), int(bx2 * sx), int(by2 * sy))
-            shared.append(SharedFaceResult(result.face_id, mean_rgb, rects_disp, bbox_disp))
+            shared.append(SharedFaceResult(result.face_id, mean_rgb, sample_ts, rects_disp, bbox_disp))
 
         with result_lock:
             result_store["results"] = shared
@@ -701,6 +1098,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera", type=int, default=CAM_INDEX, help="Camera index to open, usually 0 or 1.")
     parser.add_argument("--width", type=int, default=FRAME_W, help="Requested camera frame width.")
     parser.add_argument("--height", type=int, default=FRAME_H, help="Requested camera frame height.")
+    parser.add_argument(
+        "--signal-csv",
+        "--raw-signal-csv",
+        dest="signal_csv",
+        default="",
+        help="Optional CSV path for raw ROI RGB samples collected during the run.",
+    )
+    parser.add_argument(
+        "--cleaned-signal-csv",
+        default="",
+        help="Optional CSV path for STEP 5 cleaned RGB/rPPG samples saved on shutdown.",
+    )
+    parser.add_argument(
+        "--preprocess-window-seconds",
+        type=float,
+        default=PREPROCESS_WINDOW_SECONDS,
+        help="STEP 5 preprocessing window size in seconds.",
+    )
+    parser.add_argument(
+        "--preprocess-step-seconds",
+        type=float,
+        default=PREPROCESS_STEP_SECONDS,
+        help="STEP 5 preprocessing step size in seconds.",
+    )
+    parser.add_argument(
+        "--preprocess-smooth-seconds",
+        type=float,
+        default=PREPROCESS_SMOOTH_SECONDS,
+        help="Optional moving-average smoothing duration after bandpass filtering.",
+    )
     return parser.parse_args()
 
 
@@ -745,6 +1172,8 @@ def main() -> None:
     frame_times = deque(maxlen=30)
     show_spo2 = True
     rppg_pool: Dict[int, RppgProcessor] = {}
+    signal_logs: Dict[int, RgbSignalLog] = {}
+    last_logged_sample_ts: Dict[int, float] = {}
     face_results_disp: List[SharedFaceResult] = []
     spo2_frame_counter = 0
 
@@ -776,7 +1205,24 @@ def main() -> None:
                         rppg_pool[face_result.face_id] = RppgProcessor()
                         log_info(f"SpO2 processor created for face {face_result.face_id}.")
                     if face_result.rgb is not None:
-                        rppg_pool[face_result.face_id].push_frame_direct(*face_result.rgb)
+                        r_mean, g_mean, b_mean = face_result.rgb
+                        rppg_pool[face_result.face_id].push_frame_direct(r_mean, g_mean, b_mean)
+
+                        last_ts = last_logged_sample_ts.get(face_result.face_id)
+                        if last_ts is None or face_result.timestamp > last_ts:
+                            signal_log = signal_logs.setdefault(face_result.face_id, RgbSignalLog(face_result.face_id))
+                            signal_log.append(face_result.timestamp, r_mean, g_mean, b_mean)
+                            last_logged_sample_ts[face_result.face_id] = face_result.timestamp
+
+                            # STEP 5 integration starts: clean raw RGB in reusable time windows.
+                            sample_fps = fps if fps > 5 else RPPG_ASSUMED_FPS
+                            signal_log.preprocess_pending_windows(
+                                window_seconds=args.preprocess_window_seconds,
+                                step_seconds=args.preprocess_step_seconds,
+                                fallback_fps=sample_fps,
+                                smooth_seconds=args.preprocess_smooth_seconds,
+                            )
+                            # STEP 5 integration ends.
 
                 spo2_frame_counter += 1
                 if spo2_frame_counter >= SPO2_UPDATE_INTERVAL:
@@ -824,6 +1270,19 @@ def main() -> None:
         log_info("Stopping worker thread.")
         stop_workers.set()
         face_thread.join(timeout=2.0)
+
+        for signal_log in signal_logs.values():
+            signal_log.preprocess_pending_windows(window_seconds=args.preprocess_window_seconds,
+                step_seconds=args.preprocess_step_seconds,
+                fallback_fps=fps if fps > 5 else RPPG_ASSUMED_FPS,
+                smooth_seconds=args.preprocess_smooth_seconds,
+                flush=True,
+            )
+        if args.signal_csv:
+            save_raw_rgb_csv(args.signal_csv, signal_logs)
+        if args.cleaned_signal_csv:
+            save_cleaned_rgb_csv(args.cleaned_signal_csv, signal_logs)
+
         cap.release()
         cv2.destroyAllWindows()
         log_info("Shutdown complete.")
