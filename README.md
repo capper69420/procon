@@ -2,7 +2,7 @@
 
 This folder contains only the two standalone tools from the original project. It does not use the FastAPI backend, React frontend, Supabase, or any dashboard code.
 
-## Folder layout
+## Folder layout 1
 
 ```text
 standalone_speech_health/
