@@ -1,0 +1,74 @@
+[INFO]    16:41:19 | Camera 0 opened at 640x480.
+[INFO]    16:41:19 | Face worker input: 640x360; display scale 1.00x, 1.33x.
+[INFO]    16:41:19 | Controls: [q] quit  [s] toggle SpO2 panel
+[INFO]    16:41:19 | Face worker started.
+[INFO]    16:41:25 | Face track 1 created.
+[INFO]    16:41:25 | SpO2 processor created for face 1.
+[INFO]    16:41:26 | Face track 2 created.
+[INFO]    16:41:26 | SpO2 processor created for face 2.
+[INFO]    16:41:28 | Face track 1 expired.
+[INFO]    16:41:28 | SpO2 processor removed for expired face 1.
+[INFO]    16:41:29 | SpO2 Random Forest model initialized from synthetic calibration data.
+[INFO]    16:41:31 | Face track 3 created.
+[INFO]    16:41:31 | SpO2 processor created for face 3.
+[INFO]    16:41:33 | Face track 3 expired.
+[INFO]    16:41:33 | SpO2 processor removed for expired face 3.
+[INFO]    16:41:57 | Face track 4 created.
+[INFO]    16:41:57 | SpO2 processor created for face 4.
+[INFO]    16:41:58 | Face track 2 expired.
+[INFO]    16:41:58 | SpO2 processor removed for expired face 2.
+[INFO]    16:42:00 | SpO2 Random Forest model initialized from synthetic calibration data.
+[INFO]    16:42:05 | Face track 5 created.
+[INFO]    16:42:05 | SpO2 processor created for face 5.
+[INFO]    16:42:07 | Face track 5 expired.
+[INFO]    16:42:07 | SpO2 processor removed for expired face 5.
+[INFO]    16:42:08 | Face track 4 expired.
+[INFO]    16:42:08 | SpO2 processor removed for expired face 4.
+[INFO]    16:42:10 | Face track 6 created.
+[INFO]    16:42:10 | SpO2 processor created for face 6.
+[INFO]    16:42:13 | Face track 7 created.
+[INFO]    16:42:13 | SpO2 processor created for face 7.
+[INFO]    16:42:13 | Face track 6 expired.
+[INFO]    16:42:13 | SpO2 processor removed for expired face 6.
+[INFO]    16:42:15 | Face track 7 expired.
+[INFO]    16:42:15 | SpO2 processor removed for expired face 7.
+[INFO]    16:42:39 | Face track 8 created.
+[INFO]    16:42:39 | SpO2 processor created for face 8.
+[INFO]    16:42:42 | SpO2 Random Forest model initialized from synthetic calibration data.
+[INFO]    16:42:44 | Face track 8 expired.
+[INFO]    16:42:44 | SpO2 processor removed for expired face 8.
+[INFO]    16:42:50 | Face track 9 created.
+[INFO]    16:42:50 | SpO2 processor created for face 9.
+[INFO]    16:42:53 | Face track 10 created.
+[INFO]    16:42:53 | SpO2 processor created for face 10.
+[INFO]    16:42:53 | Face track 9 expired.
+[INFO]    16:42:53 | SpO2 processor removed for expired face 9.
+[INFO]    16:42:56 | SpO2 Random Forest model initialized from synthetic calibration data.
+[INFO]    16:45:32 | Face track 11 created.
+[INFO]    16:45:32 | SpO2 processor created for face 11.
+[INFO]    16:45:32 | SpO2 panel disabled.
+[INFO]    16:45:36 | SpO2 panel enabled.
+[INFO]    16:45:36 | SpO2 processor created for face 11.
+[INFO]    16:45:36 | Face track 10 expired.
+[INFO]    16:45:37 | SpO2 panel disabled.
+[INFO]    16:45:37 | SpO2 panel enabled.
+[INFO]    16:45:37 | SpO2 processor created for face 11.
+[INFO]    16:45:37 | SpO2 panel disabled.
+[INFO]    16:45:38 | SpO2 panel enabled.
+[INFO]    16:45:38 | SpO2 processor created for face 11.
+[INFO]    16:45:38 | SpO2 panel disabled.
+[INFO]    16:45:39 | SpO2 panel enabled.
+[INFO]    16:45:39 | SpO2 processor created for face 11.
+[INFO]    16:45:39 | SpO2 panel disabled.
+[INFO]    16:45:39 | SpO2 panel enabled.
+[INFO]    16:45:39 | SpO2 processor created for face 11.
+[INFO]    16:45:43 | SpO2 Random Forest model initialized from synthetic calibration data.
+[INFO]    16:45:59 | Face track 12 created.
+[INFO]    16:45:59 | SpO2 processor created for face 12.
+[INFO]    16:46:00 | SpO2 panel disabled.
+[INFO]    16:46:01 | Quit requested.
+[INFO]    16:46:01 | Stopping worker thread.
+[INFO]    16:46:01 | Face worker stopped.
+[INFO]    16:46:01 | Saved 3324 raw RGB samples to raw_rgb.csv.
+[INFO]    16:46:01 | Saved 3280 cleaned RGB samples to cleaned_rgb.csv.
+[INFO]    16:46:01 | Shutdown complete.
