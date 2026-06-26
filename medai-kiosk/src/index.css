@@ -1,0 +1,52 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", "Noto Sans JP", system-ui, sans-serif;
+
+  --color-brand-50: #eef4ff;
+  --color-brand-100: #d9e6ff;
+  --color-brand-400: #5b8def;
+  --color-brand-500: #3b6fec;
+  --color-brand-600: #2f5fe0;
+  --color-brand-700: #2750c2;
+
+  --color-success-50: #ecfdf3;
+  --color-success-500: #16a34a;
+  --color-success-600: #15803d;
+
+  --color-warning-50: #fffbeb;
+  --color-warning-500: #d97706;
+  --color-warning-600: #b45309;
+
+  --color-danger-50: #fef2f2;
+  --color-danger-500: #dc2626;
+  --color-danger-600: #b91c1c;
+
+  --color-surface: #f4f6fb;
+  --color-surface-card: #ffffff;
+  --color-ink-900: #101828;
+  --color-ink-600: #475467;
+  --color-ink-400: #94a3b8;
+}
+
+html, body, #root { height: 100%; }
+
+body {
+  background: var(--color-surface);
+  color: var(--color-ink-900);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+* { -webkit-tap-highlight-color: transparent; }
+.kiosk-shell { user-select: none; }
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+@keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.pulse-dot { animation: pulse-dot 1.6s ease-in-out infinite; }
+
+@keyframes fade-in-up { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.animate-fade-in-up { animation: fade-in-up 0.45s ease-out both; }

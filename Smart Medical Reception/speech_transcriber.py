@@ -60,19 +60,23 @@ class Transcriber:
     def transcribe_file(
         self,
         audio_path: str,
+        language: Optional[str] = None,
     ) -> tuple[list[TranscriptSegment], Optional[str]]:
         """
         Transcribe a complete audio file. Returns segments and detected language.
         Segments are empty when language is not whitelisted.
         """
-        segments_gen, info = self.model.transcribe(
-            audio_path,
-            task="transcribe",
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 300},
-            condition_on_previous_text=False,
-            beam_size=self.beam_size,
-        )
+        options = {
+            "task": "transcribe",
+            "vad_filter": True,
+            "vad_parameters": {"min_silence_duration_ms": 300},
+            "condition_on_previous_text": False,
+            "beam_size": self.beam_size,
+        }
+        if language:
+            options["language"] = language
+
+        segments_gen, info = self.model.transcribe(audio_path, **options)
 
         detected = info.language
         if detected not in self.language_whitelist:
@@ -136,4 +140,3 @@ class Transcriber:
                 )
             )
         return results, detected
-
